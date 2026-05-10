@@ -1580,10 +1580,16 @@ PacketManager_MakePacket_CITIES_AND_CHARS(uint8_t *buf, uint8_t numCharacters, c
 	unsigned int i;
 	unsigned int numStartingPlaces;
 
+	USED(numCharacters);
 	numStartingPlaces = g_PlaceNameCount;
 
 	PutPacketType(buf, PacketType_CITIES_AND_CHARS, PacketDynamicSize);
-	PutByte(buf, numCharacters);
+	// Slot count must equal the number of slot entries written below (5).
+	// CrossUO/ClassicUO read exactly `count * 60` bytes for slots before
+	// reading the city count; if the count disagrees with the actual slot
+	// payload, the city-count byte is read from the wrong offset and the
+	// city list ends up empty, blanking the SelectTown screen.
+	PutByte(buf, 5);
 	for (i = 0; i < 5; i++) {
 		PutString(buf, &characterNames[30 * i], 30);
 		PutString(buf, &characterPasswords[30 * i], 30);
