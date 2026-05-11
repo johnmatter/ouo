@@ -5766,6 +5766,11 @@ HandlePacket_BRITANNIA_SELECT(CUserSock *this, uint8_t *buf)
 		// GodClient 0x8C handler (0x0043CCA0) adds 1000 to the port.
 		// Send port - 1000 so client connects back to the right port.
 		// No Blowfish/Twofish: GodClient game connection is plaintext.
+		//
+		// detectedGodClient is no longer set automatically (the prior
+		// "seeded plaintext == GodClient" heuristic in usersock.c
+		// misfired for modern Crypt=no emulator clients). To use real
+		// GodClient with this path, run with -client god208 explicitly.
 		port = g_ServerPort - 1000;
 		clientEnum = CLIENT_GOD208;
 	} else {

@@ -289,8 +289,12 @@ AutoDetectPolynomial(CUserSock *this, uint32_t seed, uint8_t *encrypted, int len
  * AutoDetectPlaintext - check if data after the seed is unencrypted.
  *
  * Called when AutoDetectXorKeys fails (no key matched). Checks whether
- * the data is already valid plaintext, indicating a GodClient 2.0.8n
- * connection (all encryption patched out).
+ * the data is already valid plaintext. Historically this was treated as
+ * a GodClient 2.0.8n indicator (the only era with "encryption patched
+ * out" was the developer client); since the rise of FOSS emulator
+ * clients (CrossUO, ClassicUO) the same plaintext shape can come from
+ * any modern client running with Crypt=no, so callers must not use
+ * a positive return value as a GodClient identification on its own.
  *
  * Two valid plaintext patterns:
  *   0x80 (ACCT_LOGIN_REQ): standard UI login flow.

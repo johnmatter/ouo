@@ -180,7 +180,19 @@ UserSock_DoHandlePacket(CUserSock *this)
 					CUserSock_InitCrypt(this, seed);
 					UserSock_Decrypt(this, &this->buf[4], this->curr - 4);
 				} else if (AutoDetectPlaintext(&this->buf[4], this->curr - 4)) {
-					this->detectedGodClient = 1;
+                                // Seeded plaintext after encrypted-cipher trials failed.
+                                // Historically this was treated as a positive GodClient
+                                // (2.0.8n) identification, but modern emulator clients
+                                // (CrossUO, ClassicUO) running with Crypt=no also send
+                                // seeded plaintext and land here. Setting
+                                // detectedGodClient based on this signal alone causes
+                                // packet_handler.c:5765 to subtract 1000 from the relay
+                                // port, breaking the login->game-server handoff for
+                                // those clients (they reconnect to port-1000 where
+                                // OUO isn't listening). Accept the plaintext but do
+                                // not tag as GodClient; rely on CLIENT_VERSION (0xBD)
+                                // to refine detectedKeyIndex. Real GodClient users
+                                // must run with -client god208 for the port quirk.
 				} else {
 					this->socket.status = SocketClosing;
 					return 0;
