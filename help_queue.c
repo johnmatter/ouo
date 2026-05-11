@@ -2310,12 +2310,19 @@ GmCommandDispatch(CHelpQueue *q, CPlayer *player, const char *text)
 		return;
 	}
 
-	// Custom: .save - force immediate world save
+	// Custom: .save - force immediate world save.
+	// Save first; rotate .mul -> .bkp only on success, restore from
+	// .bkp on failure so the world stays recoverable.
 	if (strcmp(cmd, "save") == 0 && CPlayer_IsEditing(player)) {
-		BackupFile(GLOBAL_file_dynidx0_mul, GLOBAL_file_dynidx0_bkp);
-		BackupFile(GLOBAL_file_dynamic0_mul, GLOBAL_file_dynamic0_bkp);
-		SaveDynamic0();
-		CPlayer_SystemMessage(player, "World saved");
+		if (SaveDynamic0() == 0) {
+			BackupFile(GLOBAL_file_dynidx0_mul, GLOBAL_file_dynidx0_bkp);
+			BackupFile(GLOBAL_file_dynamic0_mul, GLOBAL_file_dynamic0_bkp);
+			CPlayer_SystemMessage(player, "World saved");
+		} else {
+			BackupFile(GLOBAL_file_dynidx0_bkp, GLOBAL_file_dynidx0_mul);
+			BackupFile(GLOBAL_file_dynamic0_bkp, GLOBAL_file_dynamic0_mul);
+			CPlayer_SystemMessage(player, "World save aborted - restored from backup");
+		}
 		return;
 	}
 

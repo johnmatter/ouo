@@ -286,10 +286,16 @@ Server_Loop(void)
 	CDebugConsole_AppendText("Exiting...");
 
 	// CUSTOM: world-state persistence (binary has no disk-save path).
+	// Save first; rotate .mul -> .bkp only on success, restore from
+	// .bkp on failure. Same pattern as the periodic save in time.c.
 	Watchdog_Shutdown();
-	BackupFile(GLOBAL_file_dynidx0_mul, GLOBAL_file_dynidx0_bkp);
-	BackupFile(GLOBAL_file_dynamic0_mul, GLOBAL_file_dynamic0_bkp);
-	SaveDynamic0();
+	if (SaveDynamic0() == 0) {
+		BackupFile(GLOBAL_file_dynidx0_mul, GLOBAL_file_dynidx0_bkp);
+		BackupFile(GLOBAL_file_dynamic0_mul, GLOBAL_file_dynamic0_bkp);
+	} else {
+		BackupFile(GLOBAL_file_dynidx0_bkp, GLOBAL_file_dynidx0_mul);
+		BackupFile(GLOBAL_file_dynamic0_bkp, GLOBAL_file_dynamic0_mul);
+	}
 	Account_SaveAll();
 	ContainerHandle_ShutdownAll();
 

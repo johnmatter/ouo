@@ -45,6 +45,7 @@ struct CDataBuffer {
 	uint8_t *data;
 	int len;
 	int cap;
+	int overflowed; /* set by CDataBuffer_Append when cap is hit */
 };
 
 /*
@@ -88,7 +89,7 @@ void CGuard_Save(CNPC *npc, CDataBuffer *b, int writeMarker); // 0x004C832B
 void CShopkeeper_Save(CNPC *npc, CDataBuffer *b, int writeMarker); // 0x004C835B
 void CEgg_Save(CItem *item, CDataBuffer *b, int writeMarker); // 0x004C83D0
 void CPlayer_Save(CPlayer *player, CDataBuffer *b, int writeMarker); // 0x004C842C
-void SaveDynamic0(void); // 0x004C8A5C
+int SaveDynamic0(void); // 0x004C8A5C - returns 0 on success, 1 if aborted partway
 void LoadDynamic0(void); // 0x004C8DD7
 void Dynamic_FireObjectLoadedEvents(void); // 0x004C90CC
 void Dynamic_SetPendingLoad(void); // 0x004C9161

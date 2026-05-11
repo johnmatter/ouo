@@ -459,10 +459,20 @@ CTimeManager_Update(void)
 	// Custom: periodic world save every 4096 ticks (~17 min). UoDemo
 	// ships SaveDynamic0 unwired; this restores a save cadence using
 	// the same bitmask pattern as the other periodic subsystems.
+	//
+	// Save first, then rotate .mul -> .bkp only on success. If the
+	// save aborted (cycle in spatialNext, buffer overflow, etc.) the
+	// partial .mul is restored from the prior-good .bkp so the world
+	// is recoverable on the next restart and the next save attempt
+	// doesn't get a head start with corrupt state.
 	if ((tickCount & 0xFFF) == 0 && tickCount != 0) {
-		BackupFile(GLOBAL_file_dynidx0_mul, GLOBAL_file_dynidx0_bkp);
-		BackupFile(GLOBAL_file_dynamic0_mul, GLOBAL_file_dynamic0_bkp);
-		SaveDynamic0();
+		if (SaveDynamic0() == 0) {
+			BackupFile(GLOBAL_file_dynidx0_mul, GLOBAL_file_dynidx0_bkp);
+			BackupFile(GLOBAL_file_dynamic0_mul, GLOBAL_file_dynamic0_bkp);
+		} else {
+			BackupFile(GLOBAL_file_dynidx0_bkp, GLOBAL_file_dynidx0_mul);
+			BackupFile(GLOBAL_file_dynamic0_bkp, GLOBAL_file_dynamic0_mul);
+		}
 		Account_SaveAll();
 	}
 

@@ -1326,11 +1326,18 @@ CPlayer_Save(CPlayer *player, CDataBuffer *b, int writeMarker)
  * Saves all dynamic objects into dynidx0.mul / dynamic0.mul, one
  * buffer per map block. Dead code - never called.
  */
-void
+int
 SaveDynamic0(void)
 {
+	/* Defensive cap on the per-block spatialNext walk: a cycle in the
+	 * linked list would otherwise serialize the same items forever and
+	 * overflow the per-block CDataBuffer. No legitimate block holds
+	 * anywhere near this many items. */
+	enum { kMaxItemsPerBlock = 100000 };
+
 	CIndexedFileManager indexedFile;
 	int blockIdx;
+	int saveAborted = 0;
 
 	CIndexedFileManager_Constructor(&indexedFile);
 
@@ -1342,6 +1349,7 @@ SaveDynamic0(void)
 		CItem *itemHead;
 		CItem *item;
 		CDataBuffer buf;
+		int itemCount;
 
 		CDataBuffer_Constructor(&buf);
 		itemHead = g_MapBlocks[blockIdx].itemHead;
@@ -1353,11 +1361,29 @@ SaveDynamic0(void)
 		}
 
 		item = itemHead;
+		itemCount = 0;
 		while (item != NULL) {
+			if (itemCount++ >= kMaxItemsPerBlock) {
+				fprintf(stderr, "SaveDynamic0: block %d spatialNext walk exceeded %d items - cycle suspected, aborting save\n",
+				        blockIdx, kMaxItemsPerBlock);
+				saveAborted = 1;
+				break;
+			}
 			if (!(item->itemFlags & 0x08)) {
 				((void (*)(CItem *, CDataBuffer *, int))VT_FN(item, VT_SAVE))(item, &buf, 1);
 			}
+			if (buf.overflowed) {
+				fprintf(stderr, "SaveDynamic0: block %d CDataBuffer overflowed at item %d - aborting save\n",
+				        blockIdx, itemCount);
+				saveAborted = 1;
+				break;
+			}
 			item = item->spatialNext;
+		}
+
+		if (saveAborted) {
+			CDataBuffer_Destructor(&buf);
+			break;
 		}
 
 		CDataBuffer_Append(&buf, "end", 4);
@@ -1371,6 +1397,13 @@ SaveDynamic0(void)
 	EntityManager_RemoveAllFromWorld();
 
 	CIndexedFileManager_Destructor(&indexedFile);
+
+	if (saveAborted) {
+		EventLogger_Log(&g_EventLogger, 0, 0, 0, "", "save", "error",
+		        "SaveDynamic0 aborted - on-disk dynamic0 is partial; caller should restore from .bkp");
+		return 1;
+	}
+	return 0;
 }
 
 /*

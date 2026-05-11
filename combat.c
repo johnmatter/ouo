@@ -2312,6 +2312,7 @@ CDataBuffer_Constructor(CDataBuffer *b)
 	b->data = malloc(0x400);
 	b->len = 0;
 	b->cap = 0x400;
+	b->overflowed = 0;
 }
 
 /*
@@ -2336,10 +2337,15 @@ CDataBuffer_Destructor(CDataBuffer *b)
 void
 CDataBuffer_Append(CDataBuffer *b, const void *src, int srcLen)
 {
+	if (b->overflowed)
+		return;
 	if (b->len + srcLen > b->cap) {
 		while (b->len + srcLen > b->cap) {
 			if (b->cap >= 0x40000000) {
+				/* Only warn once per buffer; downstream code must check
+				 * b->overflowed and abort whatever it was building. */
 				fprintf(stderr, "CDataBuffer_Append: cap overflow (len=%d srcLen=%d cap=%d)\n", b->len, srcLen, b->cap);
+				b->overflowed = 1;
 				return;
 			}
 			b->cap <<= 1;
