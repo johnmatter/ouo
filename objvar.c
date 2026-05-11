@@ -127,9 +127,14 @@ ObjVar_ValidateListPtr(CList *ptr)
  *
  * Emits each node as a " TYPE VALUE" token into buf, recursing into
  * nested lists. Types: 0=int, 1=str, 2=ust, 3=loc, 4=obj, 5=lis.
+ *
+ * FIXED: the binary's recursion has no cycle detection. A CList that
+ * (directly or transitively) contains itself recurses forever, growing
+ * buf without bound. We track ancestors on the call stack and emit
+ * "lis 0" for any sublist already being serialized.
  */
-void
-List_SerializeToBuf(CDataBuffer *buf, CList *list)
+static void
+List_SerializeToBuf_R(CDataBuffer *buf, CList *list, CList **ancestors, int depth, int maxDepth)
 {
 	char tmp[1024];
 	CListNode *node;
@@ -168,19 +173,44 @@ List_SerializeToBuf(CDataBuffer *buf, CList *list)
 			break;
 		}
 		case 5: // lis (nested CList pointer)
+		{
+			int isCycle = 0;
+			int i;
 			sublist = (CList *)(uintptr_t)node->value;
 			if (!ObjVar_ValidateListPtr(sublist)) {
 				sprintf(tmp, " %3s %d", g_tagTypeNames[node->typeTag], 0);
 				CDataBuffer_Append(buf, tmp, strlen(tmp));
-			} else {
-				sprintf(tmp, " %3s %d", g_tagTypeNames[node->typeTag], sublist->count);
-				CDataBuffer_Append(buf, tmp, strlen(tmp));
-				List_SerializeToBuf(buf, sublist);
+				break;
 			}
+			for (i = 0; i < depth; i++) {
+				if (ancestors[i] == sublist) {
+					isCycle = 1;
+					break;
+				}
+			}
+			if (isCycle || depth >= maxDepth) {
+				sprintf(tmp, " %3s %d", g_tagTypeNames[node->typeTag], 0);
+				CDataBuffer_Append(buf, tmp, strlen(tmp));
+				break;
+			}
+			sprintf(tmp, " %3s %d", g_tagTypeNames[node->typeTag], sublist->count);
+			CDataBuffer_Append(buf, tmp, strlen(tmp));
+			ancestors[depth] = sublist;
+			List_SerializeToBuf_R(buf, sublist, ancestors, depth + 1, maxDepth);
 			break;
+		}
 		}
 		node = node->next;
 	}
+}
+
+void
+List_SerializeToBuf(CDataBuffer *buf, CList *list)
+{
+	CList *ancestors[256];
+
+	ancestors[0] = list;
+	List_SerializeToBuf_R(buf, list, ancestors, 1, (int)(sizeof(ancestors) / sizeof(ancestors[0])));
 }
 
 /*
