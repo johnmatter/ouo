@@ -24,6 +24,7 @@ CItem *ArchiveHash_Find(uint32_t serial); // 0x00491A26
 StdPtrList *EntityManager_GetListPtr(void); // 0x00491A65
 CItem *EntityManager_RestoreBySerial(uint32_t serial); // 0x00491A74
 void BroadcastDestroyAndRemove(CItem *entity); // 0x00491AA7
+void EntityManager_Remove(CItem *entity); // 0x00491F10
 void EntityManager_AddAllToWorld(void); // 0x00491B48
 void EntityManager_RemoveAllFromWorld(void); // 0x00491BBF
 void EntityManager_CollectByAccountID(CVector *results, uint32_t accountId); // 0x00491C36

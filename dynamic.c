@@ -1528,8 +1528,47 @@ LoadDynamic0(void)
 
 	g_World->isLoading = 0;
 
-	while (g_PlayerList.head != NULL)
-		BroadcastDestroyAndRemove(&g_PlayerList.head->mobile.container.item);
+	/* CUSTOM: the original binary's drain loop is
+	 *
+	 *     while (g_PlayerList.head != NULL)
+	 *         BroadcastDestroyAndRemove(&g_PlayerList.head->mobile.container.item);
+	 *
+	 * which is unbounded and relies on BroadcastDestroyAndRemove ->
+	 * EntityManager_Remove -> CEntity_RemoveFromWorld eventually reaching
+	 * the player-list unlink at entity.c:448. CEntity_RemoveFromWorld has
+	 * an early return at entity.c:294-297 when VT_CANCEL_TRADE returns
+	 * non-zero, which can fire on partially-initialised post-load player
+	 * state; when it does, g_PlayerList.head never advances and the loop
+	 * spins (100% CPU at "Initializing..."). Also: there are no connected
+	 * clients at this point, so the DESTROY_OBJECT broadcast and its
+	 * CEntityMap range query are wasted work. Fix: call EntityManager_Remove
+	 * directly (no broadcast), force-unlink and warn if the head fails to
+	 * advance, and cap iterations at the initial list length plus a small
+	 * margin so a wedged entry can't OOM init. */
+	{
+		CPlayer *p;
+		int initialCount = 0;
+		int iterCap;
+		int drained = 0;
+
+		for (p = g_PlayerList.head; p != NULL; p = p->next)
+			initialCount++;
+		iterCap = initialCount + 16;
+
+		while ((p = g_PlayerList.head) != NULL) {
+			if (drained++ >= iterCap) {
+				fprintf(stderr, "LoadDynamic0: player drain exceeded cap (%d initial + 16); %p (serial 0x%08x) wedged - aborting\n",
+				        initialCount, (void *)p, p->mobile.container.item.serial);
+				break;
+			}
+			EntityManager_Remove(&p->mobile.container.item);
+			if (g_PlayerList.head == p) {
+				fprintf(stderr, "LoadDynamic0: EntityManager_Remove did not unlink %p (serial 0x%08x) from g_PlayerList; forcing unlink\n",
+				        (void *)p, p->mobile.container.item.serial);
+				CPlayerList_RemovePlayer(p);
+			}
+		}
+	}
 
 	CIndexedFileManager_Destructor(&indexedFile);
 }
