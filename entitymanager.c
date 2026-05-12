@@ -22,7 +22,9 @@
 
 static void EntityManager_DeleteArchivedEntity(uint32_t serial); // 0x00491FE0
 static void EntityManager_MarkAll(void); // 0x00491F60
-static void EntityManager_Remove(CItem *entity); // 0x00491F10
+/* No longer static — LoadDynamic0's player-drain calls this directly to
+ * avoid the per-entity DESTROY_OBJECT broadcast (no clients exist during
+ * load). See dynamic.c at the end of LoadDynamic0. */
 static CItem *EntityManager_RestoreFromArchive(uint32_t serial); // 0x00491E40
 static StdPtrList *CEntityManager_GetList(StdPtrList *this); // 0x00491E30
 static StdPtrList *EntityManager_Constructor(StdPtrList *this, const void *init); // 0x00491E10
@@ -357,7 +359,7 @@ EntityManager_RestoreFromArchive(uint32_t serial)
  * Archives an entity: remove-from-world under g_ArchiveFlag, set aiState
  * bit 0x2000, push onto the archive list.
  */
-static void
+void
 EntityManager_Remove(CItem *entity)
 {
 	g_ArchiveFlag = 1;
