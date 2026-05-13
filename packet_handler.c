@@ -5985,10 +5985,15 @@ HandlePacket_STRING_RESPONSE(CPlayer *this, uint8_t *buf)
 /*
  * 0x9D @ 0x00498846 - GMSingle
  *
- * GM single-click event handler. Requires the GM flag. Reads 9 fields and
- * forwards a subset (type, player serial, serial, artId, x, y, z) to a
- * delegate that the binary stubs out. hue, amount, and name are parsed but
- * never used.
+ * GM single-click event handler. Requires the GM flag. Reads 9 fields
+ * and forwards them to CEditorObj_HandleGMSingle, the delegate the
+ * binary stubs out (item.c:967). Per Option B' (see uo-utils/), the
+ * delegate now dispatches on `type` to wire up world-builder placement.
+ *
+ * MODIFIED: binary builds CSkillUseCtx populating only type/serial/
+ * field08/field0C/location and USED()s hue/amount/name. We additionally
+ * stash hue (field18), amount (field1C), and name (name[]) — slots
+ * already laid out in CSkillUseCtx — so the delegate can read them.
  *
  * Packet fields: type(Byte), serial(DWord), artId(DWord), x(Word),
  *   y(Word), z(Word), hue(DWord), amount(Byte), name(String30)
@@ -6038,11 +6043,16 @@ HandlePacket_GMSingle(CPlayer *this, uint8_t *buf)
 		ctx.location.x = x;
 		ctx.location.y = y;
 		ctx.location.z = z;
+		/* Custom: plumb hue/amount/name through unused ctx slots so the
+		 * delegate in item.c can act on them. */
+		ctx.field18 = hue;
+		ctx.field1C = amount;
+		if (name != NULL) {
+			memcpy(ctx.name, name, 30);
+			ctx.name[30] = '\0';
+		}
 		CEditorObj_HandleGMSingle((CEditorObj *)&g_GMPlayerList, &ctx);
 	}
-	USED(hue);
-	USED(amount);
-	USED(name);
 }
 
 /*
