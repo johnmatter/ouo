@@ -34,6 +34,7 @@
 #include "vg_pool.h"
 #include "vtable.h"
 #include "wombat_compile.h"
+#include "wombat_exec.h"
 #include "world.h"
 
 static void *CEditorObj_Constructor(CEditorObj *self); // 0x0045EBC0
@@ -960,16 +961,83 @@ CEditorObj_Constructor(CEditorObj *self)
 }
 
 /*
+ * Custom: GMSingle type-byte discriminators (Option B' world-builder
+ * pipeline; see uo-utils/uo_proto.py for the matching Python constants).
+ * The binary doesn't constrain these — HandlePacket_GMSingle forwards
+ * the raw byte through ctx->type and we dispatch here.
+ */
+#define GMS_ITEM 1   /* place item at coordinates */
+#define GMS_NPC  2   /* spawn NPC from template at coordinates */
+#define GMS_EGG  3   /* TODO: egg (spawner) placement */
+
+/*
  * 0x0045F196 - CEditorObj::HandleGMSingle
  *
- * GM editor delegate stub that always returns 0.
+ * MODIFIED: binary's stub returns 0. We dispatch on ctx->type to wire
+ * up world-builder placement primitives. The packet path is
+ * HandlePacket_GMSingle (packet_handler.c) which populates:
+ *   ctx->type    : discriminator (GMS_*)
+ *   ctx->serial  : issuing player serial
+ *   ctx->field0C : graphic / template id
+ *   ctx->location: target (x, y, z)
+ *   ctx->field18 : hue (DWord; non-zero overrides default)
+ *   ctx->field1C : amount byte (max_alive for eggs, stack size for items)
+ *   ctx->name    : freeform label, NUL-padded up to 30 chars
+ *
+ * Returns 1 on successful placement, 0 on validation failure or
+ * unknown discriminator.
  */
 int
 CEditorObj_HandleGMSingle(CEditorObj *this, void *arg)
 {
+	CSkillUseCtx *ctx;
+	uint16_t graphic;
+	uint32_t newSerial;
+	NPCTemplate *tmpl;
+	CItem *npc;
+
 	USED(this);
-	USED(arg);
-	return 0;
+
+	ctx = (CSkillUseCtx *)arg;
+	if (ctx == NULL)
+		return 0;
+
+	switch (ctx->type) {
+	case GMS_ITEM:
+		graphic = (uint16_t)(ctx->field0C & 0xFFFF);
+		if (graphic >= 0x4000)
+			return 0;
+		newSerial = Script_createGlobalObjectAt((int)graphic, &ctx->location);
+		if (newSerial == 0)
+			return 0;
+		if (ctx->field18 != 0)
+			Script_setHue(newSerial, (int)ctx->field18);
+		return 1;
+
+	case GMS_NPC:
+		graphic = (uint16_t)(ctx->field0C & 0xFFFF);
+		tmpl = CResManager_GetTemplateByID(graphic);
+		if (tmpl == NULL)
+			return 0;
+		npc = CTemplateManager_CreateFromTemplate(graphic, &ctx->location, 0, 0, NULL);
+		if (npc == NULL)
+			return 0;
+		if (ctx->field18 != 0)
+			Script_setHue(npc->serial, (int)ctx->field18);
+		return 1;
+
+	case GMS_EGG:
+		/* TODO: egg/spawner placement. The CEgg machinery in egg.c is
+		 * driven from the world load path; there's no direct
+		 * GM-placement primitive yet. Out of scope for this slice — the
+		 * Python tool will still emit GMS_EGG packets, but we drop them
+		 * here. Add a "create CEgg at coords with template + max_alive"
+		 * helper to egg.c when ready. */
+		return 0;
+
+	default:
+		return 0;
+	}
 }
 
 /*
