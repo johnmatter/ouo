@@ -222,7 +222,7 @@ void CPlayer_AddToGMCallQueue(CPlayer *this); // 0x00454D31
 int CPlayer_RemoveFromGMCallQueue(CPlayer *this); // 0x00454DC0
 int CPlayer_IsGameMaster(CPlayer *this); // 0x00454E03
 int CPlayer_HasGMBody(CPlayer *this); // 0x00454E22
-void CPlayer_CancelTrade(CPlayer *player); // 0x00454E46
+int CPlayer_CancelTrade(CPlayer *player); // 0x00454E46
 int CPlayer_ApplyResurrection(CPlayer *this, int flag); // 0x00454EB4
 void CPlayer_InstantResurrect(CPlayer *this); // 0x00455210
 void CMobile_NotifyNearbyPlayers(CItem *mob); // 0x00455264

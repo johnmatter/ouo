@@ -3273,9 +3273,15 @@ CPlayer_HasGMBody(CPlayer *this)
 /*
  * 0x00454E46 - CPlayer::CancelTrade
  *
- * Closes any trade session involving this player.
+ * Closes every trade session involving this player. Walks the whole
+ * session list (no early break, unlike CItem_CancelTrade) and always
+ * returns 0. The vtable slot is consumed via an int-returning cast at
+ * CEntity_RemoveFromWorld (entity.c:295), and the binary's
+ * CPlayer::CancelTrade has `return 0` at every exit, so a player in
+ * a trade never short-circuits RemoveFromWorld in the original. Ghidra
+ * decompile of 0x00454E46 confirms `undefined4 __fastcall` + `return 0`.
  */
-void
+int
 CPlayer_CancelTrade(CPlayer *player)
 {
 	CTradeSession *session;
@@ -3299,6 +3305,7 @@ CPlayer_CancelTrade(CPlayer *player)
 		session = nextSession;
 	}
 	USED(result);
+	return 0;
 }
 
 /*
