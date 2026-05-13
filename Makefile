@@ -218,7 +218,7 @@ HFILES=\
 all: $(TARG)
 
 $(TARG): $(OFILES) $(HFILES)
-	$(LD) $(LDFLAGS) -o $(TARG) $(OFILES)
+	$(LD) $(LDFLAGS) -o $(TARG) $(OFILES) -lm
 
 %.o: %.c $(HFILES)
 	$(CC) -c $(CFLAGS) $*.c
