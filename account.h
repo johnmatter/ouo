@@ -10,7 +10,7 @@
  * Design matches the probable original OSI 1998 implementation:
  * - Flat-file storage in access.list (one line per account)
  * - SHA-256 hashed passwords with 8-byte random salt
- * - Auto-create accounts on first login
+ * - Auto-create on first login, gated off by default-on FEAT_INVITE_ONLY
  * - Per-account character lists via the binary's own CollectByAccountID
  * - Account number is the persistent binding key, stored on characters via
  *   the binary's existing acct=%d %d save tag

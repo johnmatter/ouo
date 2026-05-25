@@ -3,7 +3,10 @@
  *
  * Logins hash into an in-memory table keyed off access.list, with
  * SHA256 + 8-byte salt password hashes stored as salt_hex:hash_hex.
- * Accounts auto-create on first successful login.
+ * Under FEAT_INVITE_ONLY (default-on via FEAT_ALL) unknown logins are
+ * rejected and accounts must be added out-of-band — edit access.list
+ * and SIGHUP the server to drive Account_ReloadAll. With invite_only
+ * off, the demo's auto-create-on-first-login behavior returns.
  *
  * CUSTOM - no binary equivalent.
  */
@@ -18,6 +21,7 @@
 #include <unistd.h>
 
 #include "account.h"
+#include "feature.h"
 #include "log.h"
 #include "sha256.h"
 
@@ -495,8 +499,18 @@ Account_FindOrCreate(const char *login, const char *password)
 		return NULL;
 
 	acct = Account_FindByLogin(login);
-	if (acct == NULL)
+	if (acct == NULL) {
+		// MODIFIED (FEAT_INVITE_ONLY): the demo and feat-off path auto-create
+		// the account on first login; with invite_only on, reject and log so
+		// access.list is the only roster source.
+		if (feat(FEAT_INVITE_ONLY)) {
+			char buf[128];
+			snprintf(buf, sizeof(buf), "rejected unknown account '%s' (invite-only)", login);
+			EventLogger_Log(&g_EventLogger, 0, 0, 0, "", "auth", "misc", buf);
+			return NULL;
+		}
 		return Account_Create(login, password);
+	}
 
 	if (acct->flags & ACCT_BANNED)
 		return NULL;
