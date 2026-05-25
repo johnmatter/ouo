@@ -73,9 +73,10 @@ int g_ScriptRecursionDepth = 0;
 /*
  * Per-event trigger parameter table.
  *
- * Extracted from the binary's ParseTrigger switch. The original uses a
- * 68-entry dispatch byte table to pick from a 45-entry jump table that
- * calls AddVarToScope with the trigger's variables and types.
+ * Extracted from the binary's ParseTrigger (0x00427436) switch. The
+ * original uses a 68-entry dispatch byte table at 0x00427EAB to pick
+ * from a 45-entry jump table at 0x00427DF7; each handler calls
+ * AddVarToScope with the trigger's variables and types.
  *
  * Type codes: 0=int, 1=string, 2=ustring, 3=loc, 4=obj, 5=list
  *
@@ -1737,9 +1738,11 @@ const uint16_t g_TokenVariants[TOKEN_TYPE_COUNT][5] = {
 };
 
 /*
- * Trigger name strings - text-based token names extracted from binary.
- * Binary: string pointers at g_TokenTypeTable[type].str for tokens 0x42..0x88.
- * These appear literally in compiled bytecodes; MatchToken uses strncmp.
+ * Trigger name strings - text-based token names. In UoDemo.exe these
+ * live as the .str field (offset +0x08) of g_TokenTypeTable's 12-byte
+ * entries at 0x00611318, rows 0x42..0x88. The C source exposes them
+ * as a flat array indexed by token type. They appear literally in
+ * compiled bytecodes; MatchToken uses strncmp.
  */
 const char *g_TriggerNames[TOKEN_TYPE_COUNT] = {
 	[TR_SPEECH] = "TR_SPEECH",

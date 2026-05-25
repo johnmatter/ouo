@@ -598,13 +598,11 @@ Combat_PlaySwingAnimation(CMobile *mob, CItem *weapon, CMobile *target)
 	backward = 0;
 	repeat = 0;
 
+	if (mob != NULL && target != NULL)
+		CEntity_GetBodyType((CItem *)mob); // result unused in binary
+
 	if (mob == NULL)
 		return;
-	if (target == NULL)
-		return;
-
-	CEntity_GetBodyType((CItem *)mob); // result unused in binary
-
 	if (CWorld_FindBySerial(g_World, mob->container.item.serial) != (CItem *)mob)
 		return;
 	if (mob->container.item.resourceEntity.entity.removedFromWorld)
@@ -1952,8 +1950,10 @@ CCombatEventList g_CombatEventList; // 0x006990A8
 /*
  * 0x004603B9 - CCombatEventList::AddNode
  *
- * Appends a new CCombatEventNode(mob, name) to the tail. Returns 0 on
- * success or -1 if the 10000-iteration safety guard tripped.
+ * Adds a new CCombatEventNode(mob, name) to the list. Returns 0 when the
+ * list was empty and the node becomes the head, or -1 when the node is
+ * appended after an existing tail. -1 is also returned, with the node
+ * left unlinked, if the 10000-iteration walk guard trips.
  */
 int
 CCombatEventList_AddNode(CCombatEventList *list, CMobile *mob, const char *name)

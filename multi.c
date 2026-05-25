@@ -32,6 +32,7 @@
 #include "utils.h"
 #include "stddeque.h"
 #include "wombat_compile.h"
+#include "feature.h"
 
 static void CMultiComponent_Constructor(CMultiComponentDef *def); // 0x0047424E
 static CMultiComponentDef *CMultiComponent_CopyConstructor(CMultiComponentDef *def, CMultiComponentDef *src); // 0x0047428A
@@ -125,6 +126,7 @@ static CMultiDef *CMultiManager_FindType(CResManager *rm, int typeId);
 static void HideItemsInVector(CVector *list);
 static void RestoreItemsInVector(CVector *list);
 static void RelocateItemsInVector(CVector *list, CLocation *oldLoc, CLocation *newLoc);
+static int CMultiSlave_MapSwitchMove_Wrap(CMultiSlave *slave, CLocation *loc);
 
 // 0x005EF190 - CMultiComponent vtable (4 function pointers)
 static void *g_vtbl_CMultiComponent[4] = {
@@ -886,8 +888,14 @@ CMultiSlave_Move(CMultiSlave *slave, CLocation *loc)
 /*
  * 0x00474E77 - CMultiSlave::MoveCheck
  *
- * Like Move, but validates the destination first; on failure restores
- * the owner and carried items to their previous positions.
+ * MODIFIED: like Move, but validates the destination first; on failure
+ * restores the owner and carried items to their previous positions.
+ * With FEAT_BOAT_MAPSWITCH a Felucca-side wrap-teleport (Q5CP wrapped
+ * by CLocation_MoveDir to the opposite world edge) is detected before
+ * validation and rerouted through CMultiSlave_MapSwitchMove_Wrap; this
+ * keeps boats wrapping correctly even when the playable area extends
+ * past Felucca's 0x1400 / 0x1000 thresholds (as it must in the demo,
+ * which uses x>=0x1400 for dungeon coordinates).
  */
 int
 CMultiSlave_MoveCheck(CMultiSlave *slave, CLocation *loc, int checkFlag)
@@ -897,6 +905,27 @@ CMultiSlave_MoveCheck(CMultiSlave *slave, CLocation *loc, int checkFlag)
 	CItem *ownerItem;
 	int result;
 	char typeFlag = 0;
+
+	if (feat(FEAT_BOAT_MAPSWITCH) && slave->carry != 0) {
+		CItem *owner = (CItem *)slave->base.ownerItem;
+		if (owner != NULL) {
+			CLocation *ownerLoc = &owner->resourceEntity.entity.location;
+			if ((int16_t)ownerLoc->x < 0x1400) {
+				int dx = (int16_t)loc->x - (int16_t)ownerLoc->x;
+				int dy = (int16_t)loc->y - (int16_t)ownerLoc->y;
+				if (dx < 0)
+					dx = -dx;
+				if (dy < 0)
+					dy = -dy;
+				// Mirror CLocation_ComputeDelta's wrap markers: a
+				// naive distance past Felucca's half-width / -height
+				// is the signature of moveDir having wrapped Q5CP
+				// across the seam.
+				if (dx > 0x0A00 || dy > 0x0800)
+					return CMultiSlave_MapSwitchMove_Wrap(slave, loc);
+			}
+		}
+	}
 
 	CVector_Constructor(&itemList, &typeFlag);
 
@@ -1189,7 +1218,7 @@ CMultiManager_SaveToMul(CResManager *this)
 		CSearchCtx_Add(&searchCtx, &findBuf);
 
 		if (!CSearchCtx_Find(&searchCtx)) {
-			keyPtr += 4;
+			keyPtr += sizeof(uintptr_t);
 			continue;
 		}
 
@@ -1258,7 +1287,7 @@ CMultiManager_SaveToMul(CResManager *this)
 		free(dataBuf);
 		count++;
 
-		keyPtr += 4;
+		keyPtr += sizeof(uintptr_t);
 	}
 
 	// Pad remaining slots to 0x1000
@@ -1822,7 +1851,7 @@ CMultiManager_RecycleMulti(CResManager *this, int bodyType, CMultiSlave *slave, 
 	defPtr = (CMultiComponentDef *)def->components.begin;
 	serialPtr = (char *)oldSerials.begin;
 
-	// Main loop: pointer-stride 0x1C for defs, 4 for old serials
+	// Main loop: pointer-stride 0x1C for defs, pointer-sized for old serials
 	while ((char *)defPtr != (char *)def->components.end) {
 		item = NULL;
 		if (serialPtr != (char *)oldSerials.end) {
@@ -1901,7 +1930,7 @@ CMultiManager_RecycleMulti(CResManager *this, int bodyType, CMultiSlave *slave, 
 
 		defPtr++;
 		if (serialPtr != (char *)oldSerials.end)
-			serialPtr += 4;
+			serialPtr += sizeof(uintptr_t);
 	}
 
 	// Cleanup: delete excess old components
@@ -1912,7 +1941,7 @@ CMultiManager_RecycleMulti(CResManager *this, int bodyType, CMultiSlave *slave, 
 				((void (*)(void *))VT_FN(item, VT_DELETE))(item);
 			}
 		}
-		serialPtr += 4;
+		serialPtr += sizeof(uintptr_t);
 	}
 
 	// Recalculate range
@@ -1985,7 +2014,7 @@ CMultiManager_MoveMultiInternal(CResManager *this, uint16_t typeId, CMultiSlave 
 	defPtr = (CMultiComponentDef *)def->components.begin;
 	serialPtr = (char *)oldSerials.begin;
 
-	// Main loop: pointer-stride 0x1C for defs, 4 for old serials
+	// Main loop: pointer-stride 0x1C for defs, pointer-sized for old serials
 	while ((char *)defPtr != (char *)def->components.end) {
 		item = NULL;
 		if (serialPtr != (char *)oldSerials.end) {
@@ -2058,7 +2087,7 @@ CMultiManager_MoveMultiInternal(CResManager *this, uint16_t typeId, CMultiSlave 
 
 		defPtr++;
 		if (serialPtr != (char *)oldSerials.end)
-			serialPtr += 4;
+			serialPtr += sizeof(uintptr_t);
 	}
 
 	// Cleanup: delete excess old components
@@ -2069,7 +2098,7 @@ CMultiManager_MoveMultiInternal(CResManager *this, uint16_t typeId, CMultiSlave 
 				((void (*)(void *))VT_FN(item, VT_DELETE))(item);
 			}
 		}
-		serialPtr += 4;
+		serialPtr += sizeof(uintptr_t);
 	}
 
 	// VT_DETACH_SPATIAL on owner (binary: unconditional)
@@ -2168,9 +2197,15 @@ CMultiManager_RecycleMultiCheck(CResManager *this, int bodyType, CMultiSlave *sl
 /*
  * 0x004774A5 - CMultiSlave::MapSwitchMove
  *
- * Returns 0 if loc is within the current map bounds; otherwise returns
- * 1 to signal a map switch. The item list it builds in the out-of-
- * bounds branch is dead code.
+ * MODIFIED: returns 0 if loc is within the configured playable bounds;
+ * otherwise the binary builds a throw-away itemList and returns 1
+ * without actually moving the boat - an unfinished stub left in the
+ * demo. With FEAT_BOAT_MAPSWITCH the call routes through
+ * CMultiSlave_MapSwitchMove_Wrap, which wraps loc Felucca-style (only
+ * when the boat's owner is on the Felucca side, matching
+ * CLocation_AddWrapped), moves the multi via CMultiSlave_Move, and
+ * fires the serverswitch script trigger (0x32) on each carried player
+ * so shipstuff.m's shipnakedhack callback completes.
  */
 int
 CMultiSlave_MapSwitchMove(CMultiSlave *slave, CLocation *loc, int checkFlag)
@@ -2184,6 +2219,9 @@ CMultiSlave_MapSwitchMove(CMultiSlave *slave, CLocation *loc, int checkFlag)
 
 	if (CBlockManager_IsValidCoord(&g_SpatialGrid, (int16_t)loc->x, (int16_t)loc->y))
 		return 0;
+
+	if (feat(FEAT_BOAT_MAPSWITCH))
+		return CMultiSlave_MapSwitchMove_Wrap(slave, loc);
 
 	typeFlag = 0;
 	CVector_Constructor(&itemList, &typeFlag);
@@ -2465,7 +2503,7 @@ CMultiManager_ValidateComponents(CResManager *this, CVector *itemList, int moveT
 		if (!(CTerrainManager_CheckMoveBlocked(item->resourceEntity.entity.location, height, moveType, NULL, 0) & 4))
 			return 0;
 
-		ptr += 4;
+		ptr += sizeof(uintptr_t);
 	}
 
 	return 1;
@@ -4897,4 +4935,64 @@ RelocateItemsInVector(CVector *list, CLocation *oldLoc, CLocation *newLoc)
 
 		((void (*)(void *, void *))VT_FN(item, VT_DROP_AT_FEET))(item, &localLoc);
 	}
+}
+
+/*
+ * Custom - CMultiSlave_MapSwitchMove_Wrap
+ *
+ * FEAT_BOAT_MAPSWITCH completion of CMultiSlave::MapSwitchMove. The
+ * binary's out-of-bounds branch is an unfinished stub; this helper
+ * wraps loc Felucca-style via CLocation_AddWrapped (only when the
+ * boat's owner is on the Felucca side - x < 0x1400 - matching the
+ * binary's own wrap gate), moves the multi via CMultiSlave_Move so
+ * carried items and players follow, then fires the serverswitch
+ * script trigger (0x32) on each carried player so shipnakedhack.m
+ * can schedule its sendPlayerZmoveStuff callback. Returns 1, the
+ * same value as the binary stub.
+ */
+static int
+CMultiSlave_MapSwitchMove_Wrap(CMultiSlave *slave, CLocation *loc)
+{
+	CItem *ownerItem;
+	CLocation *ownerLoc;
+	CLocation delta;
+	CLocation wrappedLoc;
+	CVector tmpItems;
+	CVector playerSerials;
+	char typeFlag = 0;
+	uintptr_t *p;
+
+	ownerItem = (CItem *)slave->base.ownerItem;
+	if (ownerItem == NULL)
+		return 1;
+
+	ownerLoc = &ownerItem->resourceEntity.entity.location;
+	if ((int16_t)ownerLoc->x >= 0x1400)
+		return 1;
+
+	delta.x = (uint16_t)((int16_t)loc->x - (int16_t)ownerLoc->x);
+	delta.y = (uint16_t)((int16_t)loc->y - (int16_t)ownerLoc->y);
+	delta.z = (int16_t)((int16_t)loc->z - (int16_t)ownerLoc->z);
+	CLocation_AddWrapped(ownerLoc, &wrappedLoc, &delta);
+
+	CVector_Constructor(&playerSerials, &typeFlag);
+	CVector_Constructor(&tmpItems, &typeFlag);
+	CMultiSlave_GetItems(slave, &tmpItems);
+	for (p = (uintptr_t *)tmpItems.begin; p != (uintptr_t *)tmpItems.end; p++) {
+		CItem *item = (CItem *)*p;
+		if (VT_IsPlayer(item))
+			CVector_PushBack(&playerSerials, (uintptr_t)CMobile_GetSerial((CMobile *)item));
+	}
+	CVector_Destructor(&tmpItems);
+
+	CMultiSlave_Move(slave, &wrappedLoc);
+
+	for (p = (uintptr_t *)playerSerials.begin; p != (uintptr_t *)playerSerials.end; p++) {
+		CItem *player = CWorld_FindBySerial(g_World, (uint32_t)*p);
+		if (player != NULL)
+			Entity_ExecuteEvent(&player->resourceEntity.entity, 0x32);
+	}
+
+	CVector_Destructor(&playerSerials);
+	return 1;
 }

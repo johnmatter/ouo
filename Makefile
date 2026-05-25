@@ -6,7 +6,8 @@ GIT_VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo 
 CFLAGS+=-Wall -Wextra -Wpedantic -O0 -g -std=c99 -pthread -D_POSIX_C_SOURCE=200809L
 CFLAGS+=-DOUO_VERSION='"$(GIT_VERSION)"'
 CFLAGS+=$(EXTRA_CFLAGS)
-LDFLAGS+=-pthread -lm
+LDFLAGS+=-pthread
+LDLIBS+=-lm
 
 ifdef M32
 CFLAGS+=-m32
@@ -36,6 +37,7 @@ OFILES=\
 	blockmanager.o\
 	blowfish.o\
 	book.o\
+	chat.o\
 	combat.o\
 	config.o\
 	container.o\
@@ -55,6 +57,7 @@ OFILES=\
 	filemanager.o\
 	fns.o\
 	gamecentmon.o\
+	gm_player_menu.o\
 	gmedit.o\
 	help_queue.o\
 	huffman.o\
@@ -128,6 +131,7 @@ HFILES=\
 	blowfish.h\
 	book.h\
 	channel.h\
+	chat.h\
 	combat.h\
 	config.h\
 	container.h\
@@ -149,6 +153,7 @@ HFILES=\
 	fns.h\
 	gamecentmon.h\
 	gm_names.h\
+	gm_player_menu.h\
 	gmedit.h\
 	help_queue.h\
 	huffman.h\
@@ -218,7 +223,7 @@ HFILES=\
 all: $(TARG)
 
 $(TARG): $(OFILES) $(HFILES)
-	$(LD) $(LDFLAGS) -o $(TARG) $(OFILES) -lm
+	$(LD) $(LDFLAGS) -o $(TARG) $(OFILES) $(LDLIBS)
 
 %.o: %.c $(HFILES)
 	$(CC) -c $(CFLAGS) $*.c

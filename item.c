@@ -103,6 +103,26 @@ CItem_GetFlags_VT(CItem *item)
  * loc.x is -1, prepends to the child list, fixes up weights, and emits
  * the OBJ_TO_OBJ packet (or a trade-session broadcast for secured
  * containers).
+ *
+ * FIXED: emits DESTROY_OBJECT (0x1D) instead of OBJ_TO_OBJ (0x25)
+ * when the contained entity is a mobile. The binary callers are
+ * Script_putMobContainer (stables.m: the stablemaster IS the
+ * container) and CMobile_Mount (the rider IS the container). The
+ * binary's 0x25 packet carries the mobile's bodyType in the graphic
+ * field; client builds from 3.0.6e forward dispatch the 0x25 handler
+ * by tiledata.mul flags at that graphic ID, and pet body IDs
+ * collide with wall/arch tile IDs (0xC8="stone wall",
+ * 0xE2/0xE4="stone arch", 0x190/0x191="sandstone arch", etc.) - the
+ * post-3.0.6e fallback paints the collided art tile at the entity's
+ * stored coordinates. Substituting 0x1D is safe because the pet/
+ * mount is being made invisible from the world view from this point
+ * on, and is also necessary: the earlier VT_HIDE broadcast at the
+ * entity's pre-container location can miss the only player that
+ * needs the cleanup, because CMobile_Mount detaches the rider from
+ * the spatial map before HIDE fires. Without the second 0x1D from
+ * this branch, on every client era the rider keeps a stale copy of
+ * the mount mob at its dismount-time location through every
+ * re-mount cycle.
  */
 void
 CItem_AddToContainerVT(CItem *item, CItem *container, CLocation *loc)
@@ -189,7 +209,11 @@ CItem_AddToContainerVT(CItem *item, CItem *container, CLocation *loc)
 
 		CLocation_SetLoc(&tempLoc, itemLoc);
 
-		PacketManager_MakePacket_OBJ_TO_OBJ(pktBuf, item, container);
+		if (VT_IsMobile(item)) {
+			PacketManager_MakePacket_DESTROY_OBJECT(pktBuf, item->serial);
+		} else {
+			PacketManager_MakePacket_OBJ_TO_OBJ(pktBuf, item, container);
+		}
 		SendPacketInRange(pktBuf, &tempLoc, 0x12);
 	}
 
@@ -639,6 +663,31 @@ CItem_HasResourceFlag(CItem *item)
 	if (!CItem_HasResourceRecipe(item))
 		return 0;
 	return 1;
+}
+
+/*
+ * 0x0045E5D4 - CResourceEntity::GetResourceAmount (vtable[0xA0])
+ *
+ * Sums value1 across all type-3 resource nodes matching resourceId. Used
+ * by CItem_HasPositiveResources, which dispatches via the template slot's
+ * vtable: slot lookups hit this overload and report the template's
+ * required quantity (value1), while item lookups hit the CItem variant
+ * below and report the live stack quantity (value3).
+ */
+int
+CResourceEntity_GetResourceAmount(CItem *item, uint16_t resourceId)
+{
+	CResourceNode *node;
+	int total;
+
+	total = 0;
+	node = item->resourceEntity.firstChild;
+	while (node != NULL) {
+		if (node->type == 3 && node->id == resourceId)
+			total += node->value1;
+		node = node->next;
+	}
+	return total;
 }
 
 /*

@@ -17,6 +17,7 @@
 #include "dynamic.h"
 #include "egg.h"
 #include "gm_names.h"
+#include "gm_player_menu.h"
 #include "help_queue.h"
 #include "main.h"
 #include "multi.h"
@@ -29,6 +30,7 @@
 #include "taglist.h"
 #include "template.h"
 #include "time.h"
+#include "utils.h"
 #include "vtable.h"
 #include "weapon.h"
 #include "wombat_compile.h"
@@ -128,6 +130,8 @@ static void GM_TargetInfo(CPlayer *player, uint8_t type, uint32_t serial, uint16
 static void GM_TargetScripts(CPlayer *player, uint8_t type, uint32_t serial, uint16_t x, uint16_t y, uint16_t z);
 static void GM_TargetResources(CPlayer *player, uint8_t type, uint32_t serial, uint16_t x, uint16_t y, uint16_t z);
 static void GM_TargetAIState(CPlayer *player, uint8_t type, uint32_t serial, uint16_t x, uint16_t y, uint16_t z);
+static void GM_ApplyForageMode(CPlayer *player, CItem *target, int enable);
+static void GM_TargetForageMode(CPlayer *player, uint8_t type, uint32_t serial, uint16_t x, uint16_t y, uint16_t z);
 static void GM_TargetFreeze(CPlayer *player, uint8_t type, uint32_t serial, uint16_t x, uint16_t y, uint16_t z);
 static void GM_TargetUnfreeze(CPlayer *player, uint8_t type, uint32_t serial, uint16_t x, uint16_t y, uint16_t z);
 static void GM_TargetMute(CPlayer *player, uint8_t type, uint32_t serial, uint16_t x, uint16_t y, uint16_t z);
@@ -298,6 +302,9 @@ static struct {
 
 // Custom - aiState value pending for the next .aistate target
 static int g_PendingAIState;
+
+// Custom - on/off value pending for the next .foragemode target
+static int g_PendingForageMode;
 
 /*
  * Target kinds for GM_TargetSet (.set <target> <value>).
@@ -1184,6 +1191,20 @@ GmCommandDispatch(CHelpQueue *q, CPlayer *player, const char *text)
 		return;
 	}
 
+	// Custom: .players - opens GM player-menu gump
+	if (strcmp(cmd, "players") == 0 && CPlayer_IsEditing(player)) {
+		GM_OpenPlayerMenu(player);
+		return;
+	}
+
+	// Custom: .gotoplayer <name|0xSERIAL|decimal_serial> - teleport adjacent
+	// to a connected player. Must be checked before .goto, which prefix-
+	// matches "goto".
+	if (strncmp(cmd, "gotoplayer ", 11) == 0 && CPlayer_IsEditing(player)) {
+		GM_GotoPlayerCommand(player, cmd + 11);
+		return;
+	}
+
 	// .goto <arg>
 	if (strncmp(cmd, "goto", 4) == 0) {
 		memset(name, 0, sizeof(name));
@@ -1477,6 +1498,106 @@ GmCommandDispatch(CHelpQueue *q, CPlayer *player, const char *text)
 		SendPacketToPlayer(player, tbuf, -1);
 		char msg[80];
 		snprintf(msg, sizeof(msg), "Select location to spawn %s (#%d)", g_TemplateNames[templateId] ? g_TemplateNames[templateId] : "?", templateId);
+		CPlayer_SystemMessage(player, msg);
+		return;
+	}
+
+	// Custom: .morph - show current body
+	// Custom: .morph list - list creature body names from gm_body_names
+	// Custom: .morph <id|name|off> - change player body indefinitely (polymorph)
+	// Names resolve through gm_body_names, generated from templatestable.dat
+	// with body defines expanded via bank/defines. Numeric IDs are taken as
+	// bodyType directly. off|none|0 reverts to the player's natural body
+	// (0x190 + sex). Bodies are deduplicated by name, so multiple entries
+	// can share the same human-readable label (e.g. dragon = 12 or 59).
+	if (strcmp(cmd, "morph list") == 0 && CPlayer_IsEditing(player)) {
+		char line[256];
+		int pos = 0;
+		int i, j;
+		CPlayer_SystemMessage(player, "Morph names:");
+		for (i = 0; i < (int)GM_BODY_NAMES_COUNT; i++) {
+			const char *nm = gm_body_names[i].name;
+			int dup = 0;
+			for (j = 0; j < i; j++) {
+				if (strcasecmp(gm_body_names[j].name, nm) == 0) {
+					dup = 1;
+					break;
+				}
+			}
+			if (dup)
+				continue;
+			int len = (int)strlen(nm);
+			if (pos + len + 3 > (int)sizeof(line)) {
+				CPlayer_SystemMessage(player, line);
+				pos = 0;
+			}
+			if (pos > 0) {
+				line[pos++] = ',';
+				line[pos++] = ' ';
+			}
+			memcpy(line + pos, nm, len);
+			pos += len;
+			line[pos] = '\0';
+		}
+		if (pos > 0)
+			CPlayer_SystemMessage(player, line);
+		return;
+	}
+	if (strcmp(cmd, "morph") == 0 && CPlayer_IsEditing(player)) {
+		char msg[120];
+		snprintf(msg, sizeof(msg), "Body=0x%04X. Usage: .morph <id|name|off>", player->mobile.container.item.resourceEntity.entity.bodyType);
+		CPlayer_SystemMessage(player, msg);
+		return;
+	}
+	if (strncmp(cmd, "morph ", 6) == 0 && CPlayer_IsEditing(player)) {
+		const char *arg = cmd + 6;
+		int bodyType = -1;
+		char msg[120];
+
+		if (strcasecmp(arg, "off") == 0 || strcasecmp(arg, "none") == 0 || strcmp(arg, "0") == 0) {
+			bodyType = (int)player->mobile.sex + 0x190;
+		} else if (isdigit((unsigned char)arg[0]) || arg[0] == '-' || (arg[0] == '0' && arg[1] == 'x')) {
+			int n;
+			if (sscanf(arg, "%i", &n) == 1 && n > 0 && n < 0x10000)
+				bodyType = n;
+		} else {
+			// Multiple bodies can share a name (e.g. dragon = 12 or 59
+			// because the DRAGONS define expanded to both). Collect every
+			// exact match and pick one at random so the choice mirrors the
+			// weighted random the binary uses when spawning the template.
+			// Fall back to a prefix match if no exact match exists.
+			int matches[GM_BODY_NAMES_COUNT];
+			int nMatches = 0;
+			int i;
+			for (i = 0; i < (int)GM_BODY_NAMES_COUNT; i++) {
+				if (strcasecmp(gm_body_names[i].name, arg) == 0)
+					matches[nMatches++] = gm_body_names[i].id;
+			}
+			if (nMatches == 0) {
+				int argLen = (int)strlen(arg);
+				if (argLen >= 3) {
+					for (i = 0; i < (int)GM_BODY_NAMES_COUNT; i++) {
+						if (strncasecmp(gm_body_names[i].name, arg, argLen) == 0)
+							matches[nMatches++] = gm_body_names[i].id;
+					}
+				}
+			}
+			if (nMatches > 0)
+				bodyType = matches[GetRandomRange(0, nMatches - 1)];
+		}
+
+		if (bodyType < 0) {
+			CPlayer_SystemMessage(player, "Body not found");
+			return;
+		}
+
+		CItem *self = (CItem *)&player->mobile;
+		CEntity_SetBodyType(self, (uint16_t)bodyType);
+		if (!self->resourceEntity.entity.removedFromWorld) {
+			((void (*)(void *))VT_FN(self, VT_HIDE))(self);
+			((void (*)(void *))VT_FN(self, VT_RETURN_TO_TRACKED))(self);
+		}
+		snprintf(msg, sizeof(msg), "Body set to 0x%04X", (uint16_t)bodyType);
 		CPlayer_SystemMessage(player, msg);
 		return;
 	}
@@ -2174,6 +2295,35 @@ GmCommandDispatch(CHelpQueue *q, CPlayer *player, const char *text)
 		return;
 	}
 
+	// Custom: .foragemode [0xSERIAL] [0|1] - bias an NPC to roll
+	// SEEK_DESIRES from IDLE every tick (a test aid for the unforced
+	// ecology loop). With a leading 0x... serial, acts directly;
+	// otherwise opens a target cursor. The optional trailing 0|1
+	// disables or enables it (default enable).
+	if ((strcmp(cmd, "foragemode") == 0 || strncmp(cmd, "foragemode ", 11) == 0) && CPlayer_IsEditing(player)) {
+		const char *args = (cmd[10] == ' ') ? cmd + 11 : "";
+		uint32_t tgtSerial;
+		int onoff = 1;
+		if (sscanf(args, "0x%x %d", &tgtSerial, &onoff) >= 1) {
+			CItem *tgt = CWorld_FindBySerial(g_World, tgtSerial);
+			if (tgt == NULL || !VT_IsNPC(tgt)) {
+				CPlayer_SystemMessage(player, "foragemode: NPC not found");
+				return;
+			}
+			GM_ApplyForageMode(player, tgt, onoff);
+			return;
+		}
+		int bareOnoff = 1;
+		sscanf(args, "%d", &bareOnoff);
+		g_PendingForageMode = bareOnoff;
+		uint8_t tbuf[20];
+		player->targetCallback = GM_TargetForageMode;
+		PacketManager_MakePacket_TARGET(tbuf, 0, 0, 0);
+		SendPacketToPlayer(player, tbuf, -1);
+		CPlayer_SystemMessage(player, "Select NPC for foragemode");
+		return;
+	}
+
 	// Custom: .bank - open target mobile's bank box
 	if (strcmp(cmd, "bank") == 0 && CPlayer_IsEditing(player)) {
 		uint8_t tbuf[20];
@@ -2749,6 +2899,8 @@ GmCommandDispatch(CHelpQueue *q, CPlayer *player, const char *text)
 		if (CPlayer_IsEditing(player)) {
 			CPlayer_SystemMessage(player, "GM commands:");
 			CPlayer_SystemMessage(player, ".go <X Y [Z]|name|list> - teleport to coords/location/list all");
+			CPlayer_SystemMessage(player, ".players - open connected-player teleport menu");
+			CPlayer_SystemMessage(player, ".gotoplayer <name|0xSERIAL> - teleport adjacent to a connected player");
 			CPlayer_SystemMessage(player, ".tele - click to teleport");
 			CPlayer_SystemMessage(player, ".mtele - repeating click teleport");
 			CPlayer_SystemMessage(player, ".kill - kill target mobile");
@@ -4166,16 +4318,22 @@ GM_TargetResources(CPlayer *player, uint8_t type, uint32_t serial, uint16_t x, u
 		CPlayer_SystemMessage(player, msg);
 	}
 
+	if (VT_IsMobile(target) && !VT_IsNPC(target)) {
+		snprintf(msg, sizeof(msg), "MobGold gold=%u", (unsigned)CMobile_GetTotalQuantityOfType((CMobile *)target, 0xEED));
+		CPlayer_SystemMessage(player, msg);
+	}
+
 	if (VT_IsNPC(target)) {
 		CNPC *npc = (CNPC *)target;
-		snprintf(msg, sizeof(msg), "NpcState state=%u walking=%u aitgt=%u rtype=%u rsrc=0x%08X action=0x%08X", (unsigned)npc->aiState, (unsigned)npc->isWalking,
-		        (unsigned)npc->resourceAITarget, (unsigned)npc->resourceType, (unsigned)npc->resourceTargetSerial, (unsigned)npc->actionTarget);
+		snprintf(msg, sizeof(msg), "NpcState state=%u walking=%u aitgt=%u rtype=%u rsrc=0x%08X action=0x%08X criminal=%u", (unsigned)npc->aiState, (unsigned)npc->isWalking,
+		        (unsigned)npc->resourceAITarget, (unsigned)npc->resourceType, (unsigned)npc->resourceTargetSerial, (unsigned)npc->actionTarget,
+		        (unsigned)CMobile_IsCriminal(&npc->mobile));
 		CPlayer_SystemMessage(player, msg);
 		snprintf(msg, sizeof(msg), "NpcHome x=%d y=%d z=%d loiter=%d,%d scanTimer=%u hoard=%u", (int)(int16_t)npc->homeLoc.x, (int)(int16_t)npc->homeLoc.y,
 		        (int)(int16_t)npc->homeLoc.z, (int)(int16_t)npc->loiterLoc.x, (int)(int16_t)npc->loiterLoc.y, (unsigned)npc->scanTimer, (unsigned)npc->homeInfo3);
 		CPlayer_SystemMessage(player, msg);
-		snprintf(msg, sizeof(msg), "NpcBody stomach=%u hunger=%u cap=%u tick=%u", (unsigned)npc->mobile.stomach, (unsigned)npc->mobile.hunger,
-		        (unsigned)npc->hungerCapacity, (unsigned)npc->tickCount);
+		snprintf(msg, sizeof(msg), "NpcBody stomach=%u hunger=%u cap=%u tick=%u gold=%u", (unsigned)npc->mobile.stomach, (unsigned)npc->mobile.hunger,
+		        (unsigned)npc->hungerCapacity, (unsigned)npc->tickCount, (unsigned)CMobile_GetTotalQuantityOfType(&npc->mobile, 0xEED));
 		CPlayer_SystemMessage(player, msg);
 		snprintf(msg, sizeof(msg), "NpcPos x=%d y=%d z=%d", (int)(int16_t)target->resourceEntity.entity.location.x, (int)(int16_t)target->resourceEntity.entity.location.y,
 		        (int)(int8_t)target->resourceEntity.entity.location.z);
@@ -4215,6 +4373,50 @@ GM_TargetAIState(CPlayer *player, uint8_t type, uint32_t serial, uint16_t x, uin
 	char msg[96];
 	snprintf(msg, sizeof(msg), "aiState=%u", (unsigned)npc->aiState);
 	CPlayer_SystemMessage(player, msg);
+}
+
+/*
+ * Custom - GM_ApplyForageMode
+ *
+ * Sets the "foragemode" objvar on an NPC. While it is non-zero,
+ * CNPC_HandleStates makes the NPC roll SEEK_DESIRES from IDLE every
+ * tick instead of the binary's 50% gate - a test aid that drives the
+ * unforced ecology forage loop without forcing the aiState directly.
+ */
+static void
+GM_ApplyForageMode(CPlayer *player, CItem *target, int enable)
+{
+	char msg[96];
+
+	CEntity_SetObjVar(target, "foragemode", 0, (uintptr_t)(enable ? 1 : 0));
+	snprintf(msg, sizeof(msg), "foragemode 0x%08X: %s", target->serial, enable ? "ON" : "OFF");
+	CPlayer_SystemMessage(player, msg);
+}
+
+/*
+ * Custom - GM_TargetForageMode
+ *
+ * Targeting callback for .foragemode: applies the staged on/off value
+ * (g_PendingForageMode) to the picked NPC.
+ */
+static void
+GM_TargetForageMode(CPlayer *player, uint8_t type, uint32_t serial, uint16_t x, uint16_t y, uint16_t z)
+{
+	USED(type);
+	USED(x);
+	USED(y);
+	USED(z);
+	player->targetCallback = NULL;
+	if (serial == 0) {
+		CPlayer_SystemMessage(player, "Cancelled");
+		return;
+	}
+	CItem *target = CWorld_FindBySerial(g_World, serial);
+	if (target == NULL || !VT_IsNPC(target)) {
+		CPlayer_SystemMessage(player, "Target must be an NPC");
+		return;
+	}
+	GM_ApplyForageMode(player, target, g_PendingForageMode);
 }
 
 static void
@@ -5104,4 +5306,104 @@ CHelpQueue_RemoveNode(CHelpQueue *q, CHelpRequestNode *target)
 			return;
 		}
 	}
+}
+
+/*
+ * Custom - TC_CommandDispatch
+ *
+ * Dispatch table for Test Center players (-test flag). Narrow surface
+ * (.set / .set list / .where / .help / .resurrect, all self-targeted)
+ * that reuses the same primitives as GmCommandDispatch. TC players never
+ * reach GmCommandDispatch, so GM-only commands are unreachable by
+ * construction.
+ */
+void
+TC_CommandDispatch(CPlayer *player, const char *text)
+{
+	char cmd[256];
+
+	if (text[0] == '\0')
+		return;
+	strncpy(cmd, text + 1, 254);
+	cmd[255] = '\0';
+
+	// .set <stat|skill|list> [value] - self only
+	if (strncmp(cmd, "set ", 4) == 0) {
+		const char *arg = cmd + 4;
+		const char *p;
+		int nlen;
+
+		p = arg;
+		while (*p && *p != ' ')
+			p++;
+		nlen = (int)(p - arg);
+		if (nlen == 4 && strncasecmp(arg, "list", 4) == 0) {
+			char line[256];
+			int pos = 0;
+			int i;
+			CPlayer_SystemMessage(player, "Skills:");
+			for (i = 0; i < MAX_SKILLS; i++) {
+				const char *sn = CSkillManager_GetSkillName(&g_SkillManager, (int8_t)i);
+				if (!sn)
+					continue;
+				char entry[100];
+				int elen = snprintf(entry, sizeof(entry), "%d=%s", i, sn);
+				if (pos + elen + 2 > (int)sizeof(line)) {
+					CPlayer_SystemMessage(player, line);
+					pos = 0;
+				}
+				if (pos > 0)
+					line[pos++] = ' ';
+				memcpy(line + pos, entry, elen);
+				pos += elen;
+				line[pos] = '\0';
+			}
+			if (pos > 0)
+				CPlayer_SystemMessage(player, line);
+			return;
+		}
+
+		int sType, sSkillId, sVal, sHasVal;
+		char sStrArg[64];
+		char smsg[80];
+		GM_ParseSetArgs(arg, &sType, &sSkillId, &sVal, &sHasVal, sStrArg, sizeof(sStrArg));
+		if (sType < 0) {
+			CPlayer_SystemMessage(player, ".set <stat|skill|list> [VALUE]");
+			return;
+		}
+		GM_ApplySet((CItem *)&player->mobile, sType, sSkillId, sVal, sHasVal, sStrArg, smsg, sizeof(smsg));
+		CPlayer_SystemMessage(player, smsg);
+		return;
+	}
+
+	// .where - self position
+	if (strcmp(cmd, "where") == 0) {
+		ShowEntityLocation((CItem *)player);
+		return;
+	}
+
+	// .resurrect - self-resurrect when dead
+	if (strcmp(cmd, "resurrect") == 0) {
+		if (!CPlayer_IsDead(player)) {
+			CPlayer_SystemMessage(player, "You are not dead");
+			return;
+		}
+		CPlayer_ProcessDeath(player);
+		CPlayer_InstantResurrect(player);
+		CPlayer_SystemMessage(player, "Resurrected");
+		return;
+	}
+
+	// .help - print the TC subset
+	if (strcmp(cmd, "help") == 0) {
+		CPlayer_SystemMessage(player, "Test Center commands:");
+		CPlayer_SystemMessage(player, ".set <stat|skill> [VALUE] - set self stat/skill (e.g. .set str 100, .set magery 1000)");
+		CPlayer_SystemMessage(player, ".set list - list all skill names and IDs");
+		CPlayer_SystemMessage(player, ".where - report your position");
+		CPlayer_SystemMessage(player, ".resurrect - resurrect yourself if dead");
+		CPlayer_SystemMessage(player, ".help - this message");
+		return;
+	}
+
+	CPlayer_SystemMessage(player, "Unknown Test Center command. Type .help for the list.");
 }

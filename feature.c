@@ -39,6 +39,9 @@ static const struct FeatEntry featTable[] = {
 	{ "spawn_strict_tags", FEAT_SPAWN_STRICT_TAGS },
 	{ "skill_tracking",    FEAT_SKILL_TRACKING },
 	{ "resource_regrowth", FEAT_RESOURCE_REGROWTH },
+	{ "pernpc_respawn",    FEAT_PERNPC_RESPAWN },
+	{ "chat",              FEAT_CHAT },
+	{ "boat_mapswitch",    FEAT_BOAT_MAPSWITCH },
 };
 // clang-format on
 

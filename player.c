@@ -16,6 +16,7 @@
 
 #include "account.h"
 #include "anim.h"
+#include "chat.h"
 #include "combat.h"
 #include "container.h"
 #include "corpse.h"
@@ -66,7 +67,7 @@ static int CPlayer_IsFriendAllowed(CPlayer *this, CPlayer *other); // 0x0045489D
 static void CPlayer_ToggleWarMode(CPlayer *this, int warFlag); // 0x00454905
 static void CollectContainerScripts(CItem *container, CVector *vec); // 0x00455654
 static void CollectMovementVisibilityExclude(
-        CVector *removeList, CVector *insertList, CVector *overlapList, int oldX, int oldY, int newX, int newY, int range, CItem *exclude); // 0x00455A65
+        CVector *removeList, CVector *insertList, CVector *overlapList, int newX, int newY, int oldX, int oldY, int range, CItem *exclude); // 0x00455A65
 static void StaticInit_LoginScriptList(void); // 0x0045A733
 static int CItem_GetMurderCount(CItem *entity); // 0x0048FFAA
 
@@ -708,6 +709,11 @@ NewPlayer(char *name, uint16_t locX, uint16_t locY, uint8_t locZ, uint8_t genre,
 
 	CPlayer_InitStartingEquipment(player);
 
+	// Custom: -test starter kit (5000 gold + filled spellbook + reagent bag)
+	// goes into the backpack we just created.
+	if (g_DebugTest && backpack != NULL)
+		CPlayer_AddTestCenterKit(player, backpack);
+
 	// MODIFIED 0x00450996: binary uses (g_Config.x, g_Config.y, 0) which ignores
 	// the client's city selection; use locX/locY/locZ to honor the start
 	// location chosen during character creation in newer clients.
@@ -956,6 +962,10 @@ CPlayer_Destructor(CPlayer *this)
 
 	CPlayer_CancelTrade(this);
 
+	// CUSTOM: remove the player from the chat system (no binary equivalent).
+	if (feat(FEAT_CHAT))
+		Chat_OnPlayerDisconnect(this);
+
 	CPlayerList_RemovePlayer(this);
 
 	// No-op call matching binary
@@ -1003,7 +1013,7 @@ CPlayer_HandleMovement(CPlayer *this, uint8_t direction, uint8_t sequence)
 
 	item = &this->mobile.container.item;
 
-	elapsed = GetTickCount_UO() - this->movementTimers[this->movementIndex];
+	elapsed = CTimeManager_GetTickCount() - this->movementTimers[this->movementIndex];
 
 	// 0x0045102b: vtable[0x214] GetSpeed, compute 500/speed (dead code -
 	// result stored in local but never used)
@@ -1045,7 +1055,7 @@ CPlayer_HandleMovement(CPlayer *this, uint8_t direction, uint8_t sequence)
 
 		CTerrainManager_MovePlayer(item, (int)(direction & 0xFF), sequence);
 
-		this->movementTimers[this->movementIndex] = GetTickCount_UO();
+		this->movementTimers[this->movementIndex] = CTimeManager_GetTickCount();
 		this->movementIndex = (this->movementIndex + 1) % 5;
 		return 1;
 	}
@@ -1833,7 +1843,7 @@ CPlayer_SetStamina_VT(CPlayer *self, int value)
 
 	old = self->mobile.stamina;
 	self->mobile.stamina = (uint32_t)value;
-	if (self->mobile.stamina > self->mobile.maxStamina)
+	if ((int32_t)self->mobile.stamina > (int32_t)self->mobile.maxStamina)
 		self->mobile.stamina = self->mobile.maxStamina;
 	if ((int32_t)self->mobile.stamina < 0)
 		self->mobile.stamina = 0;
@@ -2839,8 +2849,11 @@ DoMove(CItem *this, int direction, int isPlayer, uint8_t sequence)
 	CVector_Constructor(&insertList, "");
 	CVector_Constructor(&overlapList, "");
 
+	// Binary passes the post-move position first, pre-move second
+	// (DoMove @ 0x00454113): insertList then holds players newly in
+	// range and overlapList players no longer in range.
 	CollectMovementVisibilityExclude(
-	        &removeList, &insertList, &overlapList, (int)(int16_t)oldLoc.x, (int)(int16_t)oldLoc.y, (int)(int16_t)newLoc.x, (int)(int16_t)newLoc.y, 0x12, exclude);
+	        &removeList, &insertList, &overlapList, (int)(int16_t)newLoc.x, (int)(int16_t)newLoc.y, (int)(int16_t)oldLoc.x, (int)(int16_t)oldLoc.y, 0x12, exclude);
 
 	// Ghost visibility filtering
 	if (VT_IsDead(this)) {
@@ -3789,13 +3802,14 @@ GetNearbyPlayersExclude(CVector *list, CLocation *loc, int range, CItem *exclude
 /*
  * 0x00455A35 - CollectMovementVisibility
  *
- * Classifies nearby players by visibility change during movement:
- * removeList stays in range, insertList leaves, overlapList enters.
+ * Classifies nearby players by visibility change during movement. The
+ * mover's post-move position is passed first, pre-move second:
+ * removeList stays in range, insertList enters, overlapList leaves.
  */
 void
-CollectMovementVisibility(CVector *removeList, CVector *insertList, CVector *overlapList, int oldX, int oldY, int newX, int newY, int range)
+CollectMovementVisibility(CVector *removeList, CVector *insertList, CVector *overlapList, int newX, int newY, int oldX, int oldY, int range)
 {
-	CEntityMap_CollectMovementVisibility(g_ItemMap, removeList, insertList, overlapList, oldX, oldY, newX, newY, range);
+	CEntityMap_CollectMovementVisibility(g_ItemMap, removeList, insertList, overlapList, newX, newY, oldX, oldY, range);
 }
 
 /*
@@ -3805,9 +3819,9 @@ CollectMovementVisibility(CVector *removeList, CVector *insertList, CVector *ove
  * moving player itself).
  */
 static void
-CollectMovementVisibilityExclude(CVector *removeList, CVector *insertList, CVector *overlapList, int oldX, int oldY, int newX, int newY, int range, CItem *exclude)
+CollectMovementVisibilityExclude(CVector *removeList, CVector *insertList, CVector *overlapList, int newX, int newY, int oldX, int oldY, int range, CItem *exclude)
 {
-	CEntityMap_CollectMovementVisibilityExclude(g_ItemMap, removeList, insertList, overlapList, oldX, oldY, newX, newY, range, exclude);
+	CEntityMap_CollectMovementVisibilityExclude(g_ItemMap, removeList, insertList, overlapList, newX, newY, oldX, oldY, range, exclude);
 }
 
 /*
@@ -5047,12 +5061,15 @@ CEntityMap_RangeQueryExclude(CEntityMap *this, CVector *list, int16_t x, int16_t
 /*
  * 0x00457660 - CEntityMap::CollectMovementVisibility
  *
- * Classifies entities around an old position into three lists by
- * visibility change: removeList (stays in range), insertList (leaves),
- * overlapList (enters).
+ * Classifies entities by visibility change for a mover stepping to a
+ * new position from an old one. Callers pass the mover's post-move
+ * position first and pre-move position second. removeList: in range
+ * of both (stays visible). insertList: in range of the new position
+ * only (enters visibility). overlapList: in range of the old position
+ * only (leaves visibility).
  */
 void
-CEntityMap_CollectMovementVisibility(CEntityMap *this, CVector *removeList, CVector *insertList, CVector *overlapList, int oldX, int oldY, int newX, int newY, int range)
+CEntityMap_CollectMovementVisibility(CEntityMap *this, CVector *removeList, CVector *insertList, CVector *overlapList, int newX, int newY, int oldX, int oldY, int range)
 {
 	int startBlockX, endBlockX, startBlockY, endBlockY;
 	int blockIdx, rowWidth;
@@ -5060,16 +5077,16 @@ CEntityMap_CollectMovementVisibility(CEntityMap *this, CVector *removeList, CVec
 	int extent;
 	StdPtrNode *iter, *endNode, *copyIter, *tmpIter;
 
-	extent = range + ChebyshevDistXY(oldX, oldY, newX, newY);
+	extent = range + ChebyshevDistXY(newX, newY, oldX, oldY);
 
-	startBlockX = (oldX - extent) >> this->blockShift;
+	startBlockX = (newX - extent) >> this->blockShift;
 	startBlockX -= this->originX;
-	endBlockX = (oldX + extent) >> this->blockShift;
+	endBlockX = (newX + extent) >> this->blockShift;
 	endBlockX -= this->originX;
 
-	startBlockY = (oldY - extent) >> this->blockShift;
+	startBlockY = (newY - extent) >> this->blockShift;
 	startBlockY -= this->originY;
-	endBlockY = (oldY + extent) >> this->blockShift;
+	endBlockY = (newY + extent) >> this->blockShift;
 	endBlockY -= this->originY;
 
 	// Clamp to grid bounds
@@ -5099,16 +5116,16 @@ CEntityMap_CollectMovementVisibility(CEntityMap *this, CVector *removeList, CVec
 
 				{
 					void *entity = *StdPtrIter_Deref(&iter);
-					int distOld;
+					int distNew;
 
-					distOld = CMobile_DistXY(entity, oldX, oldY);
+					distNew = CMobile_DistXY(entity, newX, newY);
 
-					if (distOld <= range) {
-						int distNew;
+					if (distNew <= range) {
+						int distOld;
 
-						distNew = CMobile_DistXY(entity, newX, newY);
+						distOld = CMobile_DistXY(entity, oldX, oldY);
 
-						if (distNew <= range) {
+						if (distOld <= range) {
 							void *e = *StdPtrIter_Deref(&iter);
 							CVector_PushBack(removeList, (uintptr_t)e);
 						} else {
@@ -5116,11 +5133,11 @@ CEntityMap_CollectMovementVisibility(CEntityMap *this, CVector *removeList, CVec
 							CVector_PushBack(insertList, (uintptr_t)e);
 						}
 					} else {
-						int distNew;
+						int distOld;
 
-						distNew = CMobile_DistXY(entity, newX, newY);
+						distOld = CMobile_DistXY(entity, oldX, oldY);
 
-						if (distNew <= range) {
+						if (distOld <= range) {
 							void *e = *StdPtrIter_Deref(&iter);
 							CVector_PushBack(overlapList, (uintptr_t)e);
 						}
@@ -5848,4 +5865,60 @@ CItem_GetMurderCount(CItem *entity)
 
 	CResourceEntity_GetTagInt(entity, "murderCount", &count);
 	return count;
+}
+
+/*
+ * Custom - CPlayer_IsTestCenter
+ *
+ * Returns 1 if PlayerIsTestCenter flag (pflags bit 0x40000) is set.
+ * Granted at login when the server runs with -test.
+ */
+int
+CPlayer_IsTestCenter(CPlayer *this)
+{
+	return (this->pflags & PlayerIsTestCenter) != 0;
+}
+
+/*
+ * Custom - CPlayer_AddTestCenterKit
+ *
+ * Drops the Test Center starter kit on the new character: 10000 gold in
+ * the bank box, plus a spellbook filled with all 64 spells and a bag
+ * containing 100 of each of the 8 standard reagents in the backpack.
+ * Called from NewPlayer right after the backpack is created and
+ * InitStartingEquipment runs, only when g_DebugTest is set.
+ */
+void
+CPlayer_AddTestCenterKit(CPlayer *this, CItem *backpack)
+{
+	static const uint16_t reagents[] = { 0x0F7A, 0x0F7B, 0x0F84, 0x0F85, 0x0F86, 0x0F88, 0x0F8C, 0x0F8D };
+	CItem *bank;
+	uint32_t goldSer, bookSer, bagSer;
+	int g, i;
+
+	// 10000 gold pile into the bank box (FixBank creates it if needed)
+	FixBank(&this->mobile);
+	bank = this->mobile.equipment[29];
+	if (bank != NULL) {
+		goldSer = Script_createGlobalObjectIn(0x0EED, bank->serial);
+		if (goldSer != 0)
+			Script_addGlobalQuantity(goldSer, 9999);
+	}
+
+	// Filled spellbook (graphic 0x0EFA, spells 0x1F2D..0x1F6C - 64 spells)
+	bookSer = Script_createGlobalObjectIn(0x0EFA, backpack->serial);
+	if (bookSer != 0) {
+		for (g = 0x1F2D; g <= 0x1F6C; g++)
+			Script_createGlobalObjectIn(g, bookSer);
+	}
+
+	// Reagent bag (100 of each)
+	bagSer = Script_createGlobalObjectIn(0x0E76, backpack->serial);
+	if (bagSer != 0) {
+		for (i = 0; i < (int)(sizeof(reagents) / sizeof(reagents[0])); i++) {
+			uint32_t ser = Script_createGlobalObjectIn(reagents[i], bagSer);
+			if (ser != 0)
+				Script_addGlobalQuantity(ser, 99);
+		}
+	}
 }

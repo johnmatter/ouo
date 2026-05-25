@@ -28,6 +28,7 @@
 #include "player.h"
 #include "region.h"
 #include "shopkeeper.h"
+#include "taglist.h"
 #include "template.h"
 #include "timer.h"
 #include "utils.h"
@@ -35,6 +36,18 @@
 #include "weather.h"
 #include "wombat_compile.h"
 #include "world.h"
+
+/*
+ * Custom - CNPC.resourceAITarget discriminator (FEAT_ECOLOGY).
+ *
+ * resourceAITarget was a 0/1 flag; value NPC_RESTGT_MOBILE marks a
+ * player pickpocket target, so CNPC_PurseDesiresHandler routes it to
+ * the pickpocket path instead of the item-consume path. Value 2 is
+ * truthy, so existing if (resourceAITarget) tests are unaffected.
+ */
+#define NPC_RESTGT_NONE   0
+#define NPC_RESTGT_ITEM   1
+#define NPC_RESTGT_MOBILE 2
 
 static int CNPC_IsAversionTarget(CItem *self, CItem *target); // 0x00432300
 static int CNPC_IsPredatorTarget(CItem *self, CItem *target); // 0x004323A5
@@ -45,9 +58,14 @@ static void CNPC_IdleScan(CItem *self); // 0x00432997
 static void CNPC_EcologyTick(CItem *self); // Custom
 static void CNPC_PreyFleeScan(CItem *self, int range, int fodderType); // Custom
 static void CNPC_DepositScavengedAtShelter(CItem *self); // Custom
+static void CNPC_DepositContainerAt(CItem *self, CLocation *loc, int taggedOnly); // Custom
+static int CNPC_CarryingHoard(CNPC *npc); // Custom
+static void CNPC_StashHoardPile(CNPC *npc, CItem *pile, uint16_t body); // Custom
+static void CNPC_HoardReturnHome(CNPC *npc); // Custom
 static void CNPC_SeekShelterHandler(CNPC *npc); // Custom
 static void CNPC_SeekDesiresHandler(CNPC *npc); // Custom
 static void CNPC_PurseDesiresHandler(CNPC *npc); // Custom
+static void CNPC_PurseDesiresPickpocket(CNPC *npc, CItem *target); // Custom
 static int CNPC_GetPowerLevel(CItem *entity); // 0x00432C65
 #ifndef CUSTOM_ECOLOGY_DEBUG
 __attribute__((unused))
@@ -332,6 +350,12 @@ CNPC_GetPackingTag(CItem *entity)
  * on every return; without it the uninitialized CList.head crashed in
  * free(). Never noticed in the binary because this function was dead
  * code (IdleScan was never called).
+ *
+ * FIXED: the binary dereferences the result of CWorld_FindBySerial
+ * without a NULL check, so a stale serial in the spatial map crashes
+ * the vtable load. Skip NULL entities, matching the pattern in every
+ * other CWorld_FindBySerial caller in this file (and in the Custom
+ * CNPC_PreyFleeScan helper). Also dead-code in the binary.
  */
 static void
 CNPC_ScanForTargets(CItem *self, int range, int isPredator, int isFlying, int isPacking)
@@ -361,6 +385,9 @@ CNPC_ScanForTargets(CItem *self, int range, int isPredator, int isFlying, int is
 
 	for (node = resultList.head; node != NULL; node = node->next) {
 		entity = CWorld_FindBySerial(g_World, node->value);
+
+		if (entity == NULL)
+			continue;
 
 		if (VT_IsHidden(entity))
 			continue;
@@ -705,8 +732,9 @@ CNPC_DoWalk(CNPC *this, int mode, CLocation *loc)
 /*
  * 0x00461700 - CGuard::CGuard
  *
- * No-args guard constructor used by the save loader. Links the guard
- * into the NPC list and sets state=IDLE, npcSfx=0xFFFF.
+ * No-args guard constructor used by the save loader. Bumps vtable from
+ * CResourceMobile to CNPC (binary 0x005EECF0, our g_vtable_CGuard),
+ * links into the NPC list, sets state=IDLE, npcSfx=0xFFFF.
  */
 void
 CGuard_Constructor(CNPC *npc)
@@ -717,8 +745,8 @@ CGuard_Constructor(CNPC *npc)
 	CEntity_SetType(&mob->container.item.resourceEntity.entity, ETYPE_GUARD);
 
 	npc->nextNPC = g_NPCListHead;
-	if (g_NPCListHead != NULL)
-		g_NPCListHead->prevNPC = npc;
+	if (npc->nextNPC != NULL)
+		npc->nextNPC->prevNPC = npc;
 	g_NPCListHead = npc;
 	npc->prevNPC = NULL;
 
@@ -730,8 +758,9 @@ CGuard_Constructor(CNPC *npc)
 /*
  * 0x004617B4 - CNPC::CNPC
  *
- * Full-args NPC constructor: links the NPC into the global list,
- * sets state=IDLE, npcSfx=0xFFFF, then places the body at loc.
+ * Full-args NPC constructor: bumps vtable from CResourceMobile to CNPC
+ * (binary 0x005EECF0, our g_vtable_CGuard), links into the global NPC
+ * list, sets state=IDLE, npcSfx=0xFFFF, then places the body at loc.
  */
 void
 CNPC_Constructor(CNPC *npc, uint16_t bodyType, CLocation *loc)
@@ -739,13 +768,11 @@ CNPC_Constructor(CNPC *npc, uint16_t bodyType, CLocation *loc)
 	CMobile *mob = &npc->mobile;
 
 	CResourceMobile_Init(mob);
-
-	// CNPC and guard share ETYPE_NPC initially;
-	// CTemplateManager_CreateEntity sets ETYPE_GUARD after.
+	CEntity_SetType(&mob->container.item.resourceEntity.entity, ETYPE_GUARD);
 
 	npc->nextNPC = g_NPCListHead;
-	if (g_NPCListHead != NULL)
-		g_NPCListHead->prevNPC = npc;
+	if (npc->nextNPC != NULL)
+		npc->nextNPC->prevNPC = npc;
 	g_NPCListHead = npc;
 	npc->prevNPC = NULL;
 
@@ -1359,16 +1386,41 @@ CResourceMobile_Destructor(CNPC *npc)
 
 	NPC_RemoveFromHash(npc);
 
-	if (feat(FEAT_SPAWN_BUDGET)) {
+	if (feat(FEAT_SPAWN_BUDGET) || feat(FEAT_PERNPC_RESPAWN)) {
 		uint16_t ti = (uint16_t)CResourceEntity_GetTemplateIndex(item);
 		if (ti != 0xFFFF) {
 			NPCTemplate *tmpl = CResManager_GetTemplateByID(ti);
 			if (tmpl != NULL) {
+				CResBankRegion *region = NULL;
 				CResourceNode *nd;
+				int hasType3 = 0;
+
+				if (feat(FEAT_SPAWN_BUDGET))
+					region = CResBankManager_GetRegionByLocation(item->resourceEntity.entity.location.x, item->resourceEntity.entity.location.y);
+
 				for (nd = tmpl->resourceNodes; nd != NULL; nd = nd->next) {
 					if (nd->type != 3 || nd->id == 0)
 						continue;
-					CResBankManager_ScheduleRespawnForTemplate(&item->resourceEntity.entity.location, nd->id, nd->value1, ti);
+					if (feat(FEAT_SPAWN_BUDGET)) {
+						CResBankManager_ScheduleRespawnForTemplate(&item->resourceEntity.entity.location, nd->id, nd->value1, ti);
+						if (region != NULL && region != g_ResBankManager.noRegion)
+							CResBankRegion_SubtractFromSpawnedCount(region, nd->id, nd->value1);
+					}
+					hasType3 = 1;
+				}
+				// Per-NPC respawn only for NPCs that were created
+				// DIRECTLY in a sub-region listed in the template's
+				// <region>. NPCs created via a parent spawner's
+				// <eq> directive (e.g. Undead Group's lich child
+				// at the spawner's tile in CEMETERY_MOONGLOW,
+				// outside any LICH_* bbox) come from a separate
+				// mechanism and would compound past cap if both
+				// fired in parallel.
+				if (hasType3 && feat(FEAT_PERNPC_RESPAWN)) {
+					int16_t *cloc = (int16_t *)&item->resourceEntity.nextInContainer;
+					if (LocationInTemplateSubRegion(ti, cloc[0], cloc[1])) {
+						PendingNPCRespawn_Enqueue(ti, cloc[0], cloc[1], (int8_t)cloc[2]);
+					}
 				}
 			}
 		}
@@ -4049,6 +4101,22 @@ CNPC_HandleStates(CNPC *npc)
 			}
 		}
 
+		// Custom test aid (FEAT_ECOLOGY): an NPC tagged via the GM
+		// .foragemode command always rolls SEEK_DESIRES from IDLE, so
+		// the natural forage -> carry -> deposit loop can be exercised
+		// without the binary's 50% gate. The scan, pursuit, pickup,
+		// carry-home and deposit all still run unforced - only the
+		// random roll is replaced.
+		if (feat(FEAT_ECOLOGY)) {
+			int forageMode = 0;
+			CResourceEntity_GetTagInt((CItem *)npc, "foragemode", &forageMode);
+			if (forageMode > 0) {
+				CNPC_ShouldProcess(npc);
+				CNPC_SetState(npc, NPC_STATE_SEEK_DESIRES);
+				goto state_switch;
+			}
+		}
+
 		// All paths fall through to state switch via jmp 0x004a9ce0.
 		{
 			int roll = GetRandomRange(1, 10);
@@ -5737,7 +5805,7 @@ CNPC_HandleCorpseEat(CNPC *npc, CItem *corpse)
 static void
 CNPC_WalkAnimDispatch(CMobile *mob)
 {
-	if ((mob->movementType & 0xFF) == 2)
+	if (CMobile_GetMovementType(mob) == 2)
 		CNPC_SetRunState(mob, 1);
 	else
 		CNPC_SetRunState(mob, 0);
@@ -6158,18 +6226,20 @@ CNPC_PreyFleeScan(CItem *self, int range, int fodderType)
 }
 
 /*
- * Custom - CNPC_DepositScavengedAtShelter
+ * Custom - CNPC_DepositContainerAt
  *
- * Drops every movable child of self's container at homeLoc.
- * Completes Raph Koster's "they SHOULD be picking the item up,
- * taking it back to their shelter location, and leaving it there"
- * loop for scavenger NPCs - CNPC_ScavengerPickup is the pickup half.
+ * Drops children of self's container at loc. With taggedOnly == 0
+ * every movable child is dropped (scavenger deposit). With
+ * taggedOnly != 0 only children carrying the "hoardloot" objvar are
+ * dropped (hoarder deposit). CNPC_StashHoardPile tags only the loot a
+ * desire pursuit acquired, so a creature's intrinsic loot - even when
+ * it shares the container - is left untouched.
  *
  * Snapshot-then-drop mirrors CContainer_DecayPlace so iteration is
  * safe across VT_DROP_AT_FEET unlinking each item from the container.
  */
 static void
-CNPC_DepositScavengedAtShelter(CItem *self)
+CNPC_DepositContainerAt(CItem *self, CLocation *loc, int taggedOnly)
 {
 	CContainer *container;
 	CVector vec;
@@ -6192,14 +6262,48 @@ CNPC_DepositScavengedAtShelter(CItem *self)
 	ptr = (uintptr_t *)vec.begin;
 	while (ptr != (uintptr_t *)vec.end) {
 		CItem *child = (CItem *)*ptr;
-		if (((int (*)(void *, void *))VT_FN(child, VT_IS_MOVEABLE))(child, self)) {
+		if (((int (*)(void *, void *))VT_FN(child, VT_IS_MOVEABLE))(child, self) && (!taggedOnly || CResourceEntity_HasTag(child, "hoardloot", 0))) {
 			((void (*)(void *))VT_FN(child, VT_HIDE))(child);
-			((void (*)(void *, CLocation *))VT_FN(child, VT_DROP_AT_FEET))(child, &((CNPC *)self)->homeLoc);
+			((void (*)(void *, CLocation *))VT_FN(child, VT_DROP_AT_FEET))(child, loc);
 		}
 		ptr++;
 	}
 
 	CVector_Destructor(&vec);
+}
+
+/*
+ * Custom - CNPC_DepositScavengedAtShelter
+ *
+ * Drops every movable child of a scavenger NPC's container at
+ * homeLoc. Completes Raph Koster's "they SHOULD be picking the item
+ * up, taking it back to their shelter location, and leaving it
+ * there" loop - CNPC_ScavengerPickup is the pickup half.
+ */
+static void
+CNPC_DepositScavengedAtShelter(CItem *self)
+{
+	CNPC_DepositContainerAt(self, &((CNPC *)self)->homeLoc, 0);
+}
+
+/*
+ * Custom - CNPC_CarryingHoard
+ *
+ * True when the NPC's pack holds at least one item tagged with the
+ * "hoardloot" objvar - loot acquired by desire pursuit and not yet
+ * delivered to the lair. CNPC_PurseDesiresHandler uses this to
+ * recognise the walk-home sub-state.
+ */
+static int
+CNPC_CarryingHoard(CNPC *npc)
+{
+	CItem *child;
+
+	for (child = npc->mobile.container.contents; child != NULL; child = child->spatialNext) {
+		if (CResourceEntity_HasTag(child, "hoardloot", 0))
+			return 1;
+	}
+	return 0;
 }
 
 /*
@@ -6259,17 +6363,23 @@ CNPC_EcologyTick(CItem *self)
 
 	CNPC_IdleScan(self);
 
-	// Custom scavenger deposit-at-shelter: per Raph Koster, "they
-	// SHOULD be picking the item up, taking it back to their shelter
-	// location, and leaving it there." CNPC_ScavengerPickup (called
-	// from IdleScan) is the pickup half; this is the deposit half.
-	// Fires when the scavenger is idle-wandering at homeLoc with
-	// carried items.
-	if (npc->aiState == 0xa && CNPC_GetScavengerTag(self) > 0 && !CLocation_IsInvalid(&npc->homeLoc)) {
+	// Custom deposit-at-shelter: per Raph Koster, "they SHOULD be
+	// picking the item up, taking it back to their shelter location,
+	// and leaving it there." CNPC_ScavengerPickup (called from
+	// IdleScan) and CNPC_PurseDesiresHandler are the pickup halves;
+	// this is the passive deposit. It fires when an NPC idle-wanders
+	// at homeLoc still holding loot - a scavenger drops its whole
+	// haul, a hoarder whose walk-home was interrupted (combat, flee,
+	// stall) drops its tagged hoard.
+	if (npc->aiState == 0xa && !CLocation_IsInvalid(&npc->homeLoc)) {
 		int dx = (int)(int16_t)npc->homeLoc.x - (int)(int16_t)self->resourceEntity.entity.location.x;
 		int dy = (int)(int16_t)npc->homeLoc.y - (int)(int16_t)self->resourceEntity.entity.location.y;
-		if (abs(dx) <= 1 && abs(dy) <= 1)
-			CNPC_DepositScavengedAtShelter(self);
+		if (abs(dx) <= 1 && abs(dy) <= 1) {
+			if (CNPC_GetScavengerTag(self) > 0)
+				CNPC_DepositScavengedAtShelter(self);
+			else if (CNPC_CarryingHoard(npc))
+				CNPC_DepositContainerAt(self, &npc->homeLoc, 1);
+		}
 	}
 
 	// Custom prey-flee scan: per Raph Koster, "everything was supposed
@@ -6452,6 +6562,72 @@ CNPC_SeekShelterHandler(CNPC *npc)
 	CNPC_SetState(npc, NPC_STATE_PURSE_SHELTER);
 }
 
+/* Custom - pickpocket pursuit/cooldown windows, in AI ticks. */
+#define PICKPOCKET_PURSUE_TIMEOUT 120
+#define PICKPOCKET_COOLDOWN       90
+
+/*
+ * Custom - CNPC_TickSlotStore / CNPC_TickSlotLoad
+ *
+ * Pack a 32-bit AI tick stamp (npc->tickCount) into an otherwise-dead
+ * CLocation save field (desireLoc / lastDesireLoc). Lets the pickpocket
+ * pursuit timeout and re-rob cooldown work with no new struct field or
+ * save-format change. CLocation.x/.y are uint16_t; the dead fields init
+ * to (0xFFFF, 0xFFFF), which loads as 0xFFFFFFFF - the "never" sentinel.
+ */
+static void
+CNPC_TickSlotStore(CLocation *slot, uint32_t tick)
+{
+	slot->x = (uint16_t)tick;
+	slot->y = (uint16_t)(tick >> 16);
+}
+
+static uint32_t
+CNPC_TickSlotLoad(const CLocation *slot)
+{
+	return (uint32_t)slot->x | ((uint32_t)slot->y << 16);
+}
+
+/*
+ * Custom - CNPC_PickpocketCoolingDown
+ *
+ * True while this thief is within PICKPOCKET_COOLDOWN AI ticks of its
+ * last pickpocket attempt (stamped in lastDesireLoc). Keeps a thief
+ * from re-targeting a nearby player on its next SEEK_DESIRES roll.
+ */
+static int
+CNPC_PickpocketCoolingDown(CNPC *npc)
+{
+	uint32_t last = CNPC_TickSlotLoad(&npc->lastDesireLoc);
+
+	if (last == 0xFFFFFFFFu)
+		return 0;
+	return (npc->tickCount - last) < PICKPOCKET_COOLDOWN;
+}
+
+/*
+ * Custom - CNPC_IsPickpocketMark
+ *
+ * True when `ent` is a valid pickpocket mark for desire `pref`: a
+ * live, visible player carrying gold, `pref` is a positive GOLD
+ * desire, and this thief is not on pickpocket cooldown.
+ */
+static int
+CNPC_IsPickpocketMark(CNPC *npc, CItem *ent, CResourceNode *pref)
+{
+	if (!VT_IsPlayer(ent))
+		return 0;
+	if (pref->value2 <= 0 || (int)pref->id != g_ResTypeId_Gold)
+		return 0;
+	if (VT_IsHidden(ent) || VT_IsDead(ent))
+		return 0;
+	if (CMobile_GetTotalQuantityOfType((CMobile *)ent, 0xEED) <= 0)
+		return 0;
+	if (CNPC_PickpocketCoolingDown(npc))
+		return 0;
+	return 1;
+}
+
 /*
  * Custom - CNPC_SeekDesiresHandler
  *
@@ -6494,6 +6670,7 @@ CNPC_SeekDesiresHandler(CNPC *npc)
 	CItem *desireCandidates[10];
 	uint8_t desireIds[10];
 	uint8_t desireRates[10];
+	uint8_t desireIsMobile[10];
 	int desireDist[10];
 	int desireCount;
 	CItem *aversionTarget;
@@ -6518,6 +6695,15 @@ CNPC_SeekDesiresHandler(CNPC *npc)
 		return;
 	}
 
+	// A hoard-carrying NPC delivers its load before foraging again:
+	// route to PURSE_DESIRES, whose carry check walks it home. Without
+	// this a dense desire field could keep it scanning and never
+	// converging on the lair.
+	if (CNPC_CarryingHoard(npc)) {
+		CNPC_SetState(npc, NPC_STATE_PURSE_DESIRES);
+		return;
+	}
+
 	desireCount = 0;
 	aversionTarget = NULL;
 	aversionDist = 0;
@@ -6532,6 +6718,45 @@ CNPC_SeekDesiresHandler(CNPC *npc)
 			ent = g_SpatialGrid.cells[blockIndex].itemHead;
 			while (ent != NULL) {
 				if (ent == self || ent->resourceEntity.entity.removedFromWorld) {
+					ent = ent->spatialNext;
+					continue;
+				}
+				// Already-hoarded loot keeps a "hoardloot" tag - skip
+				// it so a hoarder never re-pursues a pile it (or
+				// another hoarder) has carried home and deposited.
+				// Deliberate: without it, hoarders would endlessly
+				// shuttle the same piles between lairs. The tag rides
+				// the pile onto the ground and decays with it, so it
+				// is self-cleaning.
+				if (CResourceEntity_HasTag(ent, "hoardloot", 0)) {
+					ent = ent->spatialNext;
+					continue;
+				}
+				if (VT_IsPlayer(ent)) {
+					// Custom: a gold-carrying player is a pickpocket
+					// desire candidate, evaluated directly here. The
+					// per-pref item/aversion loop below breaks on the
+					// first matching pref, so a player matching an
+					// earlier aversion pref never reaches the GOLD
+					// desire. Players are not item/aversion targets,
+					// so they skip that loop entirely.
+					for (pref = self->resourceEntity.firstChild; pref != NULL; pref = pref->next) {
+						if (pref->type != 2 || (int)pref->id != g_ResTypeId_Gold)
+							continue;
+						if (!CNPC_IsPickpocketMark(npc, ent, pref))
+							continue;
+						if (desireCount < 10) {
+							int pdx = (int)(int16_t)ent->resourceEntity.entity.location.x - selfX;
+							int pdy = (int)(int16_t)ent->resourceEntity.entity.location.y - selfY;
+							desireCandidates[desireCount] = ent;
+							desireIds[desireCount] = (uint8_t)pref->id;
+							desireRates[desireCount] = (uint8_t)(pref->value1 > 0 ? pref->value1 : 1);
+							desireIsMobile[desireCount] = 1;
+							desireDist[desireCount] = (pdx < 0 ? -pdx : pdx) + (pdy < 0 ? -pdy : pdy);
+							desireCount++;
+						}
+						break;
+					}
 					ent = ent->spatialNext;
 					continue;
 				}
@@ -6560,6 +6785,7 @@ CNPC_SeekDesiresHandler(CNPC *npc)
 						desireCandidates[desireCount] = ent;
 						desireIds[desireCount] = (uint8_t)pref->id;
 						desireRates[desireCount] = (uint8_t)(pref->value1 > 0 ? pref->value1 : 1);
+						desireIsMobile[desireCount] = 0;
 						desireDist[desireCount] = dist;
 						desireCount++;
 					}
@@ -6595,45 +6821,243 @@ CNPC_SeekDesiresHandler(CNPC *npc)
 	npc->resourceTargetSerial = desireCandidates[chosen]->serial;
 	npc->resourceType = desireIds[chosen];
 	npc->resourceRate = desireRates[chosen];
-	npc->resourceAITarget = 1;
 	CLocation_SetLoc(&npc->patrolTarget, &desireCandidates[chosen]->resourceEntity.entity.location);
-	// Walker arrival (AITickStep) re-dispatches via SetState(ltype).
-	// Without pointing ltype at PURSE_DESIRES, the dragon walks to the
-	// pile, then drops into whatever state StartWander had cached (IDLE
-	// or WANDER), and PurseDesiresHandler never runs. stateInfo2 is the
-	// fallback when the walk stalls out of range; route that to IDLE so
-	// a stuck dragon doesn't cycle forever against an unreachable pile.
+	npc->ltype = NPC_STATE_PURSE_DESIRES;
+	npc->isWalking = 1;
+	if (desireIsMobile[chosen]) {
+		// Custom: pickpocket pursuit of a gold-carrying player.
+		// stateInfo2 also routes to PURSE_DESIRES - a moving player
+		// stalls the walker most ticks, and the stall must re-enter
+		// the pursuit so CNPC_PurseDesiresPickpocket can re-target.
+		// desireLoc stamps the pursuit-start tick for the timeout.
+		npc->resourceAITarget = NPC_RESTGT_MOBILE;
+		npc->stateInfo2 = NPC_STATE_PURSE_DESIRES;
+		CNPC_TickSlotStore(&npc->desireLoc, npc->tickCount);
+	} else {
+		// Walker arrival (AITickStep) re-dispatches via SetState(ltype).
+		// Without pointing ltype at PURSE_DESIRES, the dragon walks to the
+		// pile, then drops into whatever state StartWander had cached (IDLE
+		// or WANDER), and PurseDesiresHandler never runs. stateInfo2 is the
+		// fallback when the walk stalls out of range; route that to IDLE so
+		// a stuck dragon doesn't cycle forever against an unreachable pile.
+		npc->resourceAITarget = NPC_RESTGT_ITEM;
+		npc->stateInfo2 = NPC_STATE_IDLE;
+	}
+	Entity_ExecuteEvent(&self->resourceEntity.entity, 0x0C, (uintptr_t)npc->resourceTargetSerial); // founddesire
+	CNPC_SetState(npc, NPC_STATE_PURSE_DESIRES);
+}
+
+/*
+ * Custom - CNPC_PurseDesiresPickpocket
+ *
+ * FEAT_ECOLOGY pickpocket pursuit - the mobile-target arm of
+ * NPC_STATE_PURSE_DESIRES. CNPC_SeekDesiresHandler picks a
+ * gold-carrying player as a desire candidate; this follows the
+ * (moving) player and, on reaching them, fires the acquiredesire
+ * event so thief.m steals 5% of their gold. Unlike the item-consume
+ * path it never drains a resource node or drops a hoard pile.
+ *
+ *   1. Abort to IDLE if the victim is gone, dead, no longer a
+ *      player, no longer carrying gold, or the pursuit timed out.
+ *   2. Re-snapshot patrolTarget onto the victim's current tile each
+ *      tick so the walker chases a moving player.
+ *   3. On adjacency, fire acquiredesire (0x34) with the victim
+ *      serial. thief.m runs takeMoney/barkTo/runAway/setCriminal;
+ *      runAway sets aiState=RUNAWAY so the thief flees. The cooldown
+ *      is stamped before the fire so a Thieves'-Guild no-op steal
+ *      still cools down.
+ */
+static void
+CNPC_PurseDesiresPickpocket(CNPC *npc, CItem *target)
+{
+	CItem *self = (CItem *)npc;
+	uint32_t victimSerial;
+	int dist;
+
+	// Abort: victim logged out, despawned, died, the serial was
+	// recycled onto a non-player, or the pockets are now empty.
+	if (target == NULL || target->resourceEntity.entity.removedFromWorld != 0 || !VT_IsPlayer(target) || VT_IsDead(target) ||
+	        CMobile_GetTotalQuantityOfType((CMobile *)target, 0xEED) <= 0) {
+		npc->resourceTargetSerial = 0;
+		npc->resourceAITarget = NPC_RESTGT_NONE;
+		npc->isWalking = 0;
+		CNPC_SetState(npc, NPC_STATE_IDLE);
+		return;
+	}
+
+	// Pursuit timeout: bound an endless chase of a fleeing player.
+	if (npc->tickCount - CNPC_TickSlotLoad(&npc->desireLoc) > PICKPOCKET_PURSUE_TIMEOUT) {
+		npc->resourceTargetSerial = 0;
+		npc->resourceAITarget = NPC_RESTGT_NONE;
+		npc->isWalking = 0;
+		CNPC_SetState(npc, NPC_STATE_IDLE);
+		return;
+	}
+
+	dist = Location_WrappedChebyshevDistance(&target->resourceEntity.entity.location, &self->resourceEntity.entity.location);
+
+	if (dist > 1) {
+		// Not adjacent: re-target the victim's current tile and keep
+		// chasing. ltype and stateInfo2 both route back to PURSE so
+		// walker arrival and walker stall both re-enter this handler.
+		CLocation_SetLoc(&npc->patrolTarget, &target->resourceEntity.entity.location);
+		npc->ltype = NPC_STATE_PURSE_DESIRES;
+		npc->stateInfo2 = NPC_STATE_PURSE_DESIRES;
+		npc->isWalking = 1;
+		return;
+	}
+
+	// Adjacent: pickpocket. Skip the node-drain/hoard/deposit path.
+	victimSerial = npc->resourceTargetSerial;
+	CNPC_TickSlotStore(&npc->lastDesireLoc, npc->tickCount);
+	npc->resourceTargetSerial = 0;
+	npc->resourceAITarget = NPC_RESTGT_NONE;
+	npc->isWalking = 0;
+
+	// thief.m's acquiredesire trigger runs takeMoney/barkTo/
+	// stopFollowing/runAway/setCriminal; runAway sets aiState=RUNAWAY.
+	Entity_ExecuteEvent(&self->resourceEntity.entity, 0x34, (uintptr_t)victimSerial); // acquiredesire
+	if (npc != g_currentNPC)
+		return;
+	CNPC_ShouldProcess(npc);
+
+	// Respect the script-driven flee; only loop back to SEEK_DESIRES
+	// if the script left the thief in PURSE (e.g. a guild-member
+	// no-op steal that never called runAway).
+	if (npc->aiState == NPC_STATE_PURSE_DESIRES)
+		CNPC_SetState(npc, NPC_STATE_SEEK_DESIRES);
+}
+
+/*
+ * Custom - CNPC_StashHoardPile
+ *
+ * Picks a desire pile up into the NPC's own pack and tags the
+ * acquired loot with the "hoardloot" objvar, so the deposit step can
+ * tell it from the creature's intrinsic loot. Mirrors
+ * CNPC_ScavengerPickup's hide-then-VT_ADD_TO_CONTAINER pattern.
+ *
+ * VT_ADD_TO_CONTAINER may merge `pile` into an existing stack and
+ * free it, so the tag cannot be applied to the pile pointer after
+ * the add. Instead the same-body children present before the add are
+ * snapshotted; only a same-body child absent from that snapshot - the
+ * freshly-added pile - is tagged. When `pile` instead stacks onto
+ * same-bodied loot the creature already carried (e.g. an orc's
+ * intrinsic SELFCONTAINED gold pile), no new child appears and
+ * nothing is tagged, so the deposit step never relocates that
+ * intrinsic loot. `body` is a pre-captured bodyType, never the pile
+ * pointer.
+ */
+static void
+CNPC_StashHoardPile(CNPC *npc, CItem *pile, uint16_t body)
+{
+	CLocation loc;
+	CVector preExisting;
+	char typeFlag = 0;
+	CItem *child;
+	uintptr_t *ptr;
+	int wasPresent;
+
+	CVector_Constructor(&preExisting, &typeFlag);
+	for (child = npc->mobile.container.contents; child != NULL; child = child->spatialNext) {
+		if ((uint16_t)(CEntity_GetBodyType(child) & 0xFFFF) == body)
+			CVector_PushBack(&preExisting, (uintptr_t)child);
+	}
+
+	((void (*)(void *))VT_FN(pile, VT_HIDE))(pile);
+	CLocation_Init(&loc);
+	CLocation_Set(&loc, -1, -1, -1);
+	((void (*)(void *, void *, void *))VT_FN(pile, VT_ADD_TO_CONTAINER))(pile, npc, &loc);
+
+	for (child = npc->mobile.container.contents; child != NULL; child = child->spatialNext) {
+		if ((uint16_t)(CEntity_GetBodyType(child) & 0xFFFF) != body)
+			continue;
+		wasPresent = 0;
+		for (ptr = (uintptr_t *)preExisting.begin; ptr != (uintptr_t *)preExisting.end; ptr++) {
+			if ((CItem *)*ptr == child) {
+				wasPresent = 1;
+				break;
+			}
+		}
+		if (!wasPresent)
+			CEntity_SetObjVar(child, "hoardloot", 0, (uintptr_t)1);
+	}
+
+	CVector_Destructor(&preExisting);
+}
+
+/*
+ * Custom - CNPC_HoardReturnHome
+ *
+ * The walk-home / deposit step of the desire hoard loop, run after a
+ * desire pickup and on every walk-home re-dispatch:
+ *
+ *   - homeLoc invalid: anchor it to the current tile.
+ *   - within 1 tile of homeLoc: drop the tagged hoard at the lair
+ *     and re-enter SEEK_DESIRES.
+ *   - otherwise: walk to homeLoc. ltype = PURSE_DESIRES routes
+ *     walker arrival back here via the carry-state check at the top
+ *     of CNPC_PurseDesiresHandler; stateInfo2 = IDLE so an
+ *     unreachable lair drops to IDLE - where the CNPC_EcologyTick
+ *     safety net deposits - instead of tight-looping.
+ */
+static void
+CNPC_HoardReturnHome(CNPC *npc)
+{
+	CItem *self = (CItem *)npc;
+	int dx, dy;
+
+	if (CLocation_IsInvalid(&npc->homeLoc))
+		CLocation_SetLoc(&npc->homeLoc, &self->resourceEntity.entity.location);
+
+	dx = (int)(int16_t)npc->homeLoc.x - (int)(int16_t)self->resourceEntity.entity.location.x;
+	dy = (int)(int16_t)npc->homeLoc.y - (int)(int16_t)self->resourceEntity.entity.location.y;
+
+	npc->resourceTargetSerial = 0;
+	npc->resourceAITarget = NPC_RESTGT_NONE;
+
+	if (abs(dx) <= 1 && abs(dy) <= 1) {
+		CNPC_DepositContainerAt(self, &npc->homeLoc, 1);
+		npc->isWalking = 0;
+		CNPC_SetState(npc, NPC_STATE_SEEK_DESIRES);
+		return;
+	}
+
+	CLocation_SetLoc(&npc->patrolTarget, &npc->homeLoc);
+	npc->isWalking = 1;
 	npc->ltype = NPC_STATE_PURSE_DESIRES;
 	npc->stateInfo2 = NPC_STATE_IDLE;
-	npc->isWalking = 1;
-	Entity_ExecuteEvent(&self->resourceEntity.entity, 0x0C, (uintptr_t)npc->resourceTargetSerial); // founddesire
 	CNPC_SetState(npc, NPC_STATE_PURSE_DESIRES);
 }
 
 /*
  * Custom - CNPC_PurseDesiresHandler
  *
- * FEAT_ECOLOGY implementation of NPC_STATE_PURSE_DESIRES. Closely
- * mirrors CNPC_PurseShelterHandler. The deposit-at-shelter step is
- * unconditional: every desire-pursuit completion anchors the lair
- * (if not already set) and drops the accumulated value at homeLoc.
- * Per Raph Koster: "the philosophy was always 'make one generic
- * behavior and data-drive it.'" Dragons accumulate gold at their
- * lair via their high GOLD desire; smaller scavengers accumulate
- * too, just less. No special-case <objvar int hoarder 1> needed.
+ * FEAT_ECOLOGY implementation of NPC_STATE_PURSE_DESIRES: the
+ * pick-up -> carry -> walk-home -> drop loop Raph Koster described
+ * ("picking the item up, taking it back to their shelter location,
+ * and leaving it there ... if you kill one, you should get the
+ * items back!").
  *
- *   1. With behavior 0x800 already set, run ResourceWanderPost
- *      (loiter ticker).
- *   2. With no resourceAITarget, fall back to a random wander
- *      centered on the NPC's current position.
- *   3. Otherwise locate the target's type-3 node for
- *      npc->resourceType, consume resourceRate from value3, and
- *      add it to homeInfo3 as the cumulative loot counter.
- *   4. Anchor homeLoc on first consumption if invalid. For a gold
- *      desire, drop a physical gold pile at homeLoc matching the
- *      current homeInfo3 counter, reset the counter to zero, and
- *      re-enter SEEK_DESIRES to loop. Other resource types keep
- *      accumulating in homeInfo3 without a visible drop.
+ *   1. Carry sub-state: an NPC holding a tagged "hoardloot" pile in
+ *      its pack is mid-delivery (or has just arrived). Routed to
+ *      CNPC_HoardReturnHome, checked first and unconditionally so a
+ *      settled NPC still finishes its delivery and walker arrival
+ *      reaches the deposit.
+ *   2. A settled NPC (0x800, shelter consumed) with no target
+ *      loiters via ResourceWanderPost; a settled NPC that does have
+ *      a desire target still forages and hoards.
+ *   3. With no resourceAITarget, fall back to a random wander.
+ *   4. A mobile target routes to CNPC_PurseDesiresPickpocket.
+ *   5. An item target is consumed into the pack: its chunk-egg
+ *      node is drained and a pile of the drained amount minted,
+ *      then tagged "hoardloot" by CNPC_StashHoardPile.
+ *   6. Anchor homeLoc on first acquisition, fire acquiredesire, and
+ *      hand off to CNPC_HoardReturnHome to walk the loot home.
+ *
+ * The loot is a live item in the NPC's pack the whole way home, so
+ * killing the NPC drops the hoard on its corpse. homeInfo1/2/3 are
+ * left untouched: they belong to CNPC_PurseShelterHandler, which
+ * stores a serial in homeInfo3 that the death-respawn path reads.
  */
 static void
 CNPC_PurseDesiresHandler(CNPC *npc)
@@ -6641,12 +7065,25 @@ CNPC_PurseDesiresHandler(CNPC *npc)
 	CItem *self = (CItem *)npc;
 	CItem *target;
 	CResourceNode *node;
-	int amount;
+	int stashed = 0;
 	uint32_t consumedSerial;
 
 	npc->speechCounter = 0;
 
-	if (npc->behaviorFlags & 0x800) {
+	// Carry sub-state: an NPC holding hoardloot-tagged loot is
+	// mid-delivery. Routed to CNPC_HoardReturnHome first and
+	// unconditionally - a settled NPC still completes its delivery,
+	// walker arrival reaches the deposit, and the check no longer
+	// depends on resourceAITarget already being NONE (a fragile
+	// invariant); CNPC_HoardReturnHome clears the target fields itself.
+	if (CNPC_CarryingHoard(npc)) {
+		CNPC_HoardReturnHome(npc);
+		return;
+	}
+
+	// A settled NPC loiters - unless it has a live desire target, in
+	// which case it still forages.
+	if ((npc->behaviorFlags & 0x800) && npc->resourceAITarget == NPC_RESTGT_NONE) {
 		CNPC_ResourceWanderPost(npc);
 		return;
 	}
@@ -6660,6 +7097,15 @@ CNPC_PurseDesiresHandler(CNPC *npc)
 	}
 
 	target = CWorld_FindBySerial(g_World, npc->resourceTargetSerial);
+
+	// Custom: a player pickpocket target routes to the pursuit/steal
+	// path, which is allowed to act on a mobile (the item path below
+	// bails on any mobile target).
+	if (npc->resourceAITarget == NPC_RESTGT_MOBILE) {
+		CNPC_PurseDesiresPickpocket(npc, target);
+		return;
+	}
+
 	if (target == NULL || ((int (*)(void *))VT_ENT_FN(&target->resourceEntity.entity, VT_IS_MOBILE))(target) != 0 || target->resourceEntity.entity.removedFromWorld != 0) {
 		CNPC_SetState(npc, NPC_STATE_IDLE);
 		return;
@@ -6670,46 +7116,56 @@ CNPC_PurseDesiresHandler(CNPC *npc)
 	if (node == NULL) {
 		CNPC_SetState(npc, NPC_STATE_IDLE);
 		return;
-	}
+	} else {
+		int amount = node->value3;
+		uint16_t pileBody;
 
-	amount = node->value3;
-	if (amount < npc->resourceRate) {
-		CNPC_ShouldProcess(npc);
-		CNPC_SetState(npc, NPC_STATE_IDLE);
-		return;
-	}
-
-	CResourceEntity_NotifyPreModify(target);
-	node->value3 -= npc->resourceRate;
-	CResourceEntity_NotifyPostModify(target);
-	CResourceEntity_NotifyPostModifyIfActive(target);
-
-	npc->homeInfo1 = npc->resourceType;
-	npc->homeInfo2 = npc->resourceRate;
-	npc->homeInfo3 += npc->resourceRate;
-
-	// Unified deposit-at-shelter: every consumption anchors the lair
-	// (if not already set) and drops the accumulated value at homeLoc.
-	if (CLocation_IsInvalid(&npc->homeLoc)) {
-		CLocation_SetLoc(&npc->homeLoc, &self->resourceEntity.entity.location);
-	}
-
-	// Physical drop: gold only. Other resource types keep accumulating
-	// in homeInfo3 without a visible drop.
-	if (npc->homeInfo3 > 0 && (int)npc->homeInfo1 == g_ResTypeId_Gold && !CLocation_IsInvalid(&npc->homeLoc)) {
-		CItem *pile = CWorld_CreateItem(g_World, 0xEED);
-		if (pile != NULL) {
-			CResourceEntity_AddNodeScaled(pile, (uint16_t)g_ResTypeId_Gold, 3, (int)npc->homeInfo3, 0, (int)npc->homeInfo3, 0, 1, 1);
-			((void (*)(void *, CLocation *))VT_FN(pile, VT_DROP_AT_FEET))(pile, &npc->homeLoc);
+		if (amount < npc->resourceRate) {
+			CNPC_ShouldProcess(npc);
+			CNPC_SetState(npc, NPC_STATE_IDLE);
+			return;
 		}
-		npc->homeInfo3 = 0;
+
+		CResourceEntity_NotifyPreModify(target);
+		node->value3 -= npc->resourceRate;
+		CResourceEntity_NotifyPostModify(target);
+		CResourceEntity_NotifyPostModifyIfActive(target);
+
+		// Chunk-egg node drained: mint a pile of the drained amount
+		// and stash it in the pack. Gold is always a 0xEED pile. A
+		// desire type with no physical body has nothing to carry.
+		pileBody = 0;
+		if ((int)npc->resourceType == g_ResTypeId_Gold)
+			pileBody = 0xEED;
+		if (pileBody != 0) {
+			CItem *pile = CWorld_CreateItem(g_World, pileBody);
+			if (pile != NULL) {
+				CResourceEntity_AddNodeScaled(pile, (uint16_t)npc->resourceType, 3, (int)npc->resourceRate, 0, (int)npc->resourceRate, 0, 1, 1);
+				// A freshly minted gold pile defaults to amount 1;
+				// set the stack count so the drained quantity shows.
+				if (pileBody == 0xEED)
+					pile->amount = (uint16_t)npc->resourceRate;
+				CNPC_StashHoardPile(npc, pile, pileBody);
+				stashed = 1;
+			}
+		}
 	}
+
+	// Anchor the lair on first acquisition so the hoard has a home.
+	if (CLocation_IsInvalid(&npc->homeLoc))
+		CLocation_SetLoc(&npc->homeLoc, &self->resourceEntity.entity.location);
 
 	consumedSerial = npc->resourceTargetSerial;
 	npc->resourceTargetSerial = 0;
-	npc->resourceAITarget = 0;
+	npc->resourceAITarget = NPC_RESTGT_NONE;
 	npc->scanTimer = 0;
 	Entity_ExecuteEvent(&self->resourceEntity.entity, 0x34, (uintptr_t)consumedSerial); // acquiredesire
+	if (npc != g_currentNPC)
+		return;
 	CNPC_ShouldProcess(npc);
-	CNPC_SetState(npc, NPC_STATE_SEEK_DESIRES);
+
+	if (stashed)
+		CNPC_HoardReturnHome(npc);
+	else
+		CNPC_SetState(npc, NPC_STATE_SEEK_DESIRES);
 }
