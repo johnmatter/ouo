@@ -26,8 +26,12 @@ enum FeatureFlag {
 	FEAT_PERNPC_RESPAWN = 1 << 13,
 	FEAT_CHAT = 1 << 14,
 	FEAT_BOAT_MAPSWITCH = 1 << 15,
+	// Deliberately parked at the high end of the word, away from the
+	// sequential block above, so newly-added low-bit features never collide
+	// with it (1 << 31 would overflow the int enum constant under -Wpedantic).
+	FEAT_INVITE_ONLY = 1 << 30,
 	FEAT_ALL = FEAT_SKILL_LOCK | FEAT_SKILL_MEDITATION | FEAT_SKILL_STEALTH | FEAT_SKILL_REMOVE_TRAP | FEAT_ECOLOGY | FEAT_LIGHTS | FEAT_CREATION_COLORS | FEAT_SPAWN_BUDGET |
-	           FEAT_SPAWN_STRICT_TAGS | FEAT_SKILL_TRACKING | FEAT_RESOURCE_REGROWTH | FEAT_PERNPC_RESPAWN | FEAT_CHAT | FEAT_BOAT_MAPSWITCH,
+	           FEAT_SPAWN_STRICT_TAGS | FEAT_SKILL_TRACKING | FEAT_RESOURCE_REGROWTH | FEAT_PERNPC_RESPAWN | FEAT_CHAT | FEAT_BOAT_MAPSWITCH | FEAT_INVITE_ONLY,
 };
 
 extern uint32_t g_Features;
